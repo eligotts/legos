@@ -43,6 +43,13 @@ from .core import (
     # Rubric
     Rubric,
     RewardFn,
+    # Credit Assignment
+    RolloutStepKey,
+    CreditAssigner,
+    GRPOCredit,
+    ConstantCredit,
+    EpisodicRewardCredit,
+    apply_credit,
     # Arena
     ModelResponse,
     InferenceClient,
@@ -75,6 +82,13 @@ __all__ = [
     # Rubric
     "Rubric",
     "RewardFn",
+    # Credit Assignment
+    "RolloutStepKey",
+    "CreditAssigner",
+    "GRPOCredit",
+    "ConstantCredit",
+    "EpisodicRewardCredit",
+    "apply_credit",
     # Arena
     "ModelResponse",
     "InferenceClient",

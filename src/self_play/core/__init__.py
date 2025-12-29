@@ -28,6 +28,15 @@ from .episode import (
 
 from .rubric import Rubric, RewardFn
 
+from .credit import (
+    RolloutStepKey,
+    CreditAssigner,
+    GRPOCredit,
+    ConstantCredit,
+    EpisodicRewardCredit,
+    apply_credit,
+)
+
 from .arena import (
     ModelResponse,
     InferenceClient,
@@ -58,6 +67,13 @@ __all__ = [
     # Rubric
     "Rubric",
     "RewardFn",
+    # Credit Assignment
+    "RolloutStepKey",
+    "CreditAssigner",
+    "GRPOCredit",
+    "ConstantCredit",
+    "EpisodicRewardCredit",
+    "apply_credit",
     # Arena
     "ModelResponse",
     "InferenceClient",

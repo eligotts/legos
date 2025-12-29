@@ -101,15 +101,6 @@ class Rollout:
     started_at: float = field(default_factory=time.time)
     ended_at: Optional[float] = None
 
-    @property
-    def messages(self) -> Messages:
-        """Full conversation as flat message list."""
-        result: Messages = []
-        for step in self.steps:
-            result.extend(step.prompt)
-            result.extend(step.completion)
-        return result
-
 
 @dataclass
 class TrainingRecord:
@@ -127,8 +118,9 @@ class TrainingRecord:
     completion_token_ids: List[int]
     logprobs: List[float]
 
-    # Reward for this role
-    reward: float
+    # Reward/advantage for this step
+    reward: float  # Raw reward from rubric
+    advantage: float = 0.0  # Credit-assigned weight (for training loss)
 
     # Metadata (for logging, not training)
     meta: Dict[str, Any] = field(default_factory=dict)

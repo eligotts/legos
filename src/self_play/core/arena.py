@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .types import Messages, Role, TrainingRecord
 from .episode import Episode, GenerateResult
+from .credit import CreditAssigner, apply_credit
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +174,13 @@ class Arena:
     Each step gets the reward for its role.
     """
 
-    def __init__(self, client: InferenceClient):
+    def __init__(
+        self,
+        client: InferenceClient,
+        credit_assigner: Optional[CreditAssigner] = None,
+    ):
         self.client = client
+        self.credit_assigner = credit_assigner
 
         # Registries
         self.roles: Dict[str, Role] = {}
@@ -316,6 +322,7 @@ class Arena:
                     completion_token_ids=step.completion_token_ids,
                     logprobs=step.completion_logprobs or [],
                     reward=step.reward,
+                    advantage=step.advantage,
                     meta={
                         "episode_type": rollout.episode_type,
                         "seed": rollout.seed,
@@ -355,10 +362,12 @@ class Arena:
             return TrainingBatch(records=[], meta={"num_results": 0, "num_records": 0})
 
         results = await self.generate_rollouts(requests, concurrency=concurrency)
-        ## TODO: assign credit to steps
-        # List of generate results, where each generate result has a rollout and children, where children is a list of generate results
-        # Goal should be to flatten (maybe?) and assign credit to each step
-        # Rollout has a field steps which is a list of steps
+
+        # Assign credit to steps
+        if self.credit_assigner is not None:
+            weights = self.credit_assigner.compute(results)
+            apply_credit(results, weights)
+
         return self.build_training_batch(results)
 
     # ---------------------------------------------------------------------------
