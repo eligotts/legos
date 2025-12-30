@@ -4,7 +4,7 @@ Core types for the self-play engine.
 Minimal set of types:
 - Role: a trainable entity (only trainable entities are roles)
 - Step: one model call in a rollout
-- Rollout: complete trace of an episode
+- Rollout: complete trace of an episode (includes artifact + metadata)
 - TrainingRecord: what gets sent to the trainer
 """
 from __future__ import annotations
@@ -81,10 +81,12 @@ class Rollout:
     Complete trace of an episode execution.
 
     Episodes populate standard fields; Rubrics consume them for scoring.
+    The artifact is the primary input content for the episode.
     """
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     episode_type: str = ""
-    seed: Dict[str, Any] = field(default_factory=dict)
+    artifact: Any = None
+    meta: Dict[str, Any] = field(default_factory=dict)
 
     # The conversation trajectory
     steps: List[Step] = field(default_factory=list)

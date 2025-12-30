@@ -58,7 +58,7 @@ async def test_episode_structure():
     # Verify Rollout structure
     rollout = result.rollout
     assert rollout.episode_type == "debate", f"Expected 'debate', got {rollout.episode_type}"
-    assert rollout.seed == {"topic": "Test topic"}, f"Seed mismatch: {rollout.seed}"
+    assert rollout.artifact == {"topic": "Test topic"}, f"Artifact mismatch: {rollout.artifact}"
     assert len(rollout.steps) == 4, f"Expected 4 steps (2 rounds * 2 roles), got {len(rollout.steps)}"
 
     # Verify alternating roles
@@ -86,7 +86,7 @@ async def test_episode_structure():
     assert "topic" in rollout.extras, "Missing topic in extras"
 
     print("  ✓ GenerateResult structure correct")
-    print("  ✓ Rollout has correct episode_type, seed, steps")
+    print("  ✓ Rollout has correct episode_type, artifact, steps")
     print("  ✓ Roles alternate correctly: Aff -> Neg -> Aff -> Neg")
     print("  ✓ All steps have required token data")
     print("  ✓ Rewards assigned to both roles")
@@ -115,11 +115,11 @@ async def test_arena_get_batch():
     for req in requests:
         assert isinstance(req, EpisodeRequest), f"Expected EpisodeRequest, got {type(req)}"
         assert req.episode_type == "debate", f"Expected 'debate', got {req.episode_type}"
-        assert "topic" in req.seed, f"Seed missing 'topic': {req.seed}"
+        assert "topic" in req.artifact, f"Artifact missing 'topic': {req.artifact}"
 
     print(f"  ✓ get_batch() returns {len(requests)} EpisodeRequests")
     print(f"  ✓ Each request has episode_type='debate'")
-    print(f"  ✓ Each request has topic in seed")
+    print(f"  ✓ Each request has topic in artifact")
 
 
 async def test_generate_rollouts_parallel():
@@ -137,8 +137,8 @@ async def test_generate_rollouts_parallel():
     )
 
     requests = [
-        EpisodeRequest(episode_type="debate", seed={"topic": "Topic A"}),
-        EpisodeRequest(episode_type="debate", seed={"topic": "Topic B"}),
+        EpisodeRequest(episode_type="debate", artifact={"topic": "Topic A"}),
+        EpisodeRequest(episode_type="debate", artifact={"topic": "Topic B"}),
     ]
 
     import time

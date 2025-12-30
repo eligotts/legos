@@ -1,15 +1,15 @@
 """
 Arena: Orchestration engine for self-play training.
 
-The Arena orchestrates the training loop:
+    The Arena orchestrates the training loop:
 1. get_batch() - Define what episodes to run
 2. generate_rollouts() - Execute episodes in parallel
 3. build_training_batch() - Convert to trainer-consumable format
 
 Episode state is transient (within one episode).
 Arena state persists across the entire training run.
-Rewards are computed by each episode's Rubric during generation.
-"""
+    Rewards are computed by each episode's Rubric during generation.
+    """
 from __future__ import annotations
 
 import asyncio
@@ -90,8 +90,6 @@ class Artifact:
     """An item in an artifact store."""
     id: str
     data: Dict[str, Any]
-    weight: float = 1.0
-
 
 class ArtifactStore:
     """Simple in-memory artifact store with weighted sampling."""
@@ -136,9 +134,9 @@ class ArtifactStore:
 
 @dataclass
 class EpisodeRequest:
-    """Request to run an episode."""
+    """Request to run an episode with a resolved artifact payload."""
     episode_type: str
-    seed: Dict[str, Any]
+    artifact: Any
     meta: Dict[str, Any] = None
 
     def __post_init__(self):
@@ -261,11 +259,20 @@ class Arena:
     async def run_episode(
         self,
         episode_type: str,
-        seed: Dict[str, Any],
+        artifact: Any,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> GenerateResult:
         """Run a single episode."""
         episode = self.episodes[episode_type]
-        return await episode.generate(self, seed)
+        return await episode.generate(self, artifact, meta=meta)
+
+    async def resolve_artifact(self, request: EpisodeRequest) -> Any:
+        """
+        Resolve the artifact for a request.
+
+        Override to load artifacts from external stores or services.
+        """
+        return request.artifact
 
     async def generate_rollouts(
         self,
@@ -284,7 +291,12 @@ class Arena:
 
         async def run_one(request: EpisodeRequest) -> GenerateResult:
             async with sem:
-                return await self.run_episode(request.episode_type, request.seed)
+                artifact = await self.resolve_artifact(request)
+                return await self.run_episode(
+                    request.episode_type,
+                    artifact,
+                    meta=request.meta,
+                )
 
         tasks = [asyncio.create_task(run_one(req)) for req in requests]
         return await asyncio.gather(*tasks)
@@ -325,7 +337,7 @@ class Arena:
                     advantage=step.advantage,
                     meta={
                         "episode_type": rollout.episode_type,
-                        "seed": rollout.seed,
+                        **rollout.meta,
                     },
                 ))
 

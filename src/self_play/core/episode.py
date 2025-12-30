@@ -91,9 +91,9 @@ class Episode(ABC):
 
     The rollout() method is fully flexible - it can:
     - Make model calls via call_model()
-    - Spawn sub-episodes via run_sub_episode()
+    - Spawn sub-episodes (use arena.generate_rollouts)
     - Do whatever custom logic needed
-
+    
     Override get_extras() to add episode-specific data to the Rollout.
     """
 
@@ -130,7 +130,7 @@ class Episode(ABC):
 
         Override to implement any pattern:
         - Chat loops (use ChatEpisode or run_chat_loop helper)
-        - Sub-episode spawning (use run_sub_episode)
+        - Sub-episode spawning (use arena.generate_rollouts)
         - Custom flows
         """
         ...
@@ -138,10 +138,6 @@ class Episode(ABC):
     # ---------------------------------------------------------------------------
     # Helpers for common operations
     # ---------------------------------------------------------------------------
-
-    def get_artifact(self, arena: Arena, seed: Dict[str, Any]) -> Any:  # noqa: ARG002
-        """Get artifact for rollout. Default: returns seed."""
-        return seed
 
     async def call_model(
         self,
@@ -151,17 +147,6 @@ class Episode(ABC):
     ) -> "ModelResponse":
         """Make a model call for a role."""
         return await arena.call_model(messages, role_id=role_id)
-
-    async def run_sub_episode(
-        self,
-        arena: Arena,
-        episode_type: str,
-        seed: Dict[str, Any],
-        artifact: Optional[Any] = None,
-    ) -> GenerateResult:
-        """Spawn a sub-episode and return its result."""
-        episode = arena.episodes[episode_type]
-        return await episode.generate(arena, seed, artifact)
 
     # ---------------------------------------------------------------------------
     # Extraction methods - override to customize
@@ -178,29 +163,26 @@ class Episode(ABC):
     async def generate(
         self,
         arena: Arena,
-        seed: Dict[str, Any],
-        artifact: Optional[Any] = None,
+        artifact: Any,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> GenerateResult:
         """
         Top-level entry point for episode execution.
 
-        1. Get artifact
-        2. Run rollout
-        3. Build Rollout with standard fields
-        4. Score with rubric (sets step.reward and rollout.reward)
-        5. Return GenerateResult with children
+        1. Run rollout
+        2. Build Rollout with standard fields
+        3. Score with rubric (sets step.reward and rollout.reward)
+        4. Return GenerateResult with children
         """
         import time
-
-        if artifact is None:
-            artifact = self.get_artifact(arena, seed)
 
         state = await self.rollout(arena, artifact)
 
         # Build rollout
         rollout = Rollout(
             episode_type=self.episode_type,
-            seed=seed,
+            artifact=artifact,
+            meta=meta or {},
             steps=state.trajectory,
             extras=self.get_extras(state),
             ended_at=time.time(),
@@ -233,23 +215,20 @@ async def run_chat_loop(
     """
     Standard chat loop for turn-taking conversations.
 
-    Each model call receives: system prompt + single user message with full history.
+    Each model call receives: system prompt (from current actor's role) + single user message with full history.
+    System prompts are loaded dynamically based on the current actor.
     History is built as a string, with env_response returning strings to append.
     """
     state.current_actor = get_initial_actor(artifact)
 
-    # Get initial messages and extract system prompt + initial history
-    initial_messages = get_initial_prompt(arena, artifact, state)
-
-    system_prompt: Optional[str] = None
-    history: str = ""
-    for msg in initial_messages:
-        if msg["role"] == "system":
-            system_prompt = msg["content"]
-        elif msg["role"] == "user":
-            history = msg["content"]
+    # Get initial history from get_initial_prompt (system prompt is now loaded dynamically per actor)
+    history: str = get_initial_prompt(arena, artifact, state)
 
     while not state.done:
+        # Get system prompt dynamically from the current actor's role
+        current_role = arena.roles.get(state.current_actor)
+        system_prompt = current_role.system_prompt if current_role else None
+
         # Build prompt: system + user with full history
         prompt: Messages = []
         if system_prompt:
@@ -310,7 +289,8 @@ class ChatEpisode(Episode):
         arena: Arena,
         artifact: Any,
         state: EpisodeState,
-    ) -> Messages:
+    ) -> str:
+        """Return the initial history string. System prompts are loaded dynamically per actor."""
         ...
 
     @abstractmethod

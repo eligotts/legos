@@ -25,6 +25,7 @@ from ..core import (
     Rollout,
     Episode,
     EpisodeState,
+    GenerateResult,
     SingleTurnEpisode,
     Rubric,
     Arena,
@@ -55,7 +56,7 @@ def make_solver_rubric(solver_role: str) -> Rubric:
             answer = completion.strip().split("\n")[-1]
 
         # Compare to ground truth
-        ground_truth = str(rollout.seed.get("ground_truth", "")).strip().lower()
+        ground_truth = str(rollout.artifact.get("ground_truth", "")).strip().lower()
         predicted = answer.strip().lower()
 
         reward = 1.0 if predicted == ground_truth else 0.0
@@ -74,7 +75,7 @@ def make_proposer_rubric(proposer_role: str, target_pass_rate: float = 0.5) -> R
         proposed = rollout.extras.get("proposed_question")
 
         # Invalid question = negative reward
-        if not proposed or not proposed.get("question") or not proposed.get("answer"):
+        if not proposed or not proposed.get("question") or not proposed.get("ground_truth"):
             return {proposer_role: -1.0}
 
         # Get pass rate from extras (computed in get_extras)
@@ -116,25 +117,15 @@ class SolveEpisode(SingleTurnEpisode):
         arena: Arena,
         artifact: Any,
         state: EpisodeState,
-    ) -> Messages:
-        role = arena.roles[self.solver_role_id]
+    ) -> str:
         question = artifact.get("question", "What is 2 + 2?")
 
-        messages: Messages = []
-        if role.system_prompt:
-            messages.append({"role": "system", "content": role.system_prompt})
-
-        messages.append({
-            "role": "user",
-            "content": f"""Solve the following question:
+        return f"""Solve the following question:
 
 {question}
 
 Think step by step, then provide your final answer.
 End your response with: "The answer is: <your answer>\""""
-        })
-
-        return messages
 
 
 # ---------------------------------------------------------------------------
@@ -198,14 +189,14 @@ class ProposerEpisode(Episode):
         state.data["proposed_question"] = proposed
 
         # Spawn solver episodes if valid question
-        if proposed and proposed.get("question") and proposed.get("answer"):
-            solver_seed = {
+        if proposed and proposed.get("question") and proposed.get("ground_truth"):
+            solver_artifact = {
                 "question": proposed["question"],
-                "ground_truth": proposed["answer"],
+                "ground_truth": proposed["ground_truth"],
             }
 
             requests = [
-                EpisodeRequest(episode_type="solve", seed=solver_seed)
+                EpisodeRequest(episode_type="solve", artifact=solver_artifact)
                 for _ in range(self.n_solver_rollouts)
             ]
             results = await arena.generate_rollouts(requests)
@@ -214,16 +205,33 @@ class ProposerEpisode(Episode):
         state.done = True
         return state
 
+    async def generate(
+        self,
+        arena: Arena,
+        artifact: Any,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> GenerateResult:
+        result = await super().generate(arena, artifact, meta=meta)
+
+        proposed = result.rollout.extras.get("proposed_question")
+        if proposed and proposed.get("question") and proposed.get("ground_truth"):
+            if "questions" in arena.stores:
+                arena.stores["questions"].add(Artifact(
+                    id=f"gen_{result.rollout.id}",
+                    data=proposed
+                ))
+
+        return result
+
     def _build_prompt(self, arena: Arena, artifact: Any) -> Messages:
         role = arena.roles[self.proposer_role_id]
 
         few_shot_text = ""
-        if "questions" in arena.stores:
-            examples = arena.stores["questions"].sample(k=3)
-            if examples:
-                few_shot_text = "Here are some example questions:\n\n"
-                for i, ex in enumerate(examples, 1):
-                    few_shot_text += f"Example {i}:\n{json.dumps(ex.data, indent=2)}\n\n"
+        examples = artifact.get("examples", [])
+        if examples:
+            few_shot_text = "Here are some example questions:\n\n"
+            for i, ex in enumerate(examples, 1):
+                few_shot_text += f"Example {i}:\n{json.dumps(ex, indent=2)}\n\n"
 
         user_content = f"""{few_shot_text}Generate a new math question. The question should:
 1. Be challenging but solvable
@@ -231,7 +239,7 @@ class ProposerEpisode(Episode):
 3. Be different from the examples
 
 Respond with a JSON object containing:
-{{"question": "<the question text>", "answer": "<the correct answer>", "difficulty": "easy|medium|hard"}}"""
+{{"question": "<the question text>", "ground_truth": "<the correct answer>"}}"""
 
         messages: Messages = []
         if role.system_prompt:
@@ -276,10 +284,24 @@ class ProposerSolverArena(Arena):
         self.batch_size = batch_size
 
     def get_batch(self) -> List[EpisodeRequest]:
-        return [
-            EpisodeRequest(episode_type="propose", seed={})
-            for _ in range(self.batch_size)
-        ]
+        propose_requests: List[EpisodeRequest] = []
+        solve_requests: List[EpisodeRequest] = []
+        if "questions" in self.stores:
+            for _ in range(self.batch_size):
+                question = self.stores["questions"].sample_one()
+                if question is None:
+                    break
+                solve_requests.append(EpisodeRequest(
+                    episode_type="solve",
+                    artifact=question.data,
+                ))
+                samples = self.stores["questions"].sample(k=3)
+                examples = [s.data for s in samples]
+                propose_requests.append(EpisodeRequest(
+                    episode_type="propose",
+                    artifact={"examples": examples},
+                ))
+        return propose_requests + solve_requests
 
 
 # ---------------------------------------------------------------------------
@@ -314,12 +336,12 @@ def create_proposer_solver_arena(
     question_store = arena.add_store("questions")
     if initial_questions is None:
         initial_questions = [
-            {"question": "What is 15 + 27?", "answer": "42", "difficulty": "easy"},
-            {"question": "If x + 5 = 12, what is x?", "answer": "7", "difficulty": "easy"},
-            {"question": "What is 8 * 5?", "answer": "40", "difficulty": "medium"},
+            {"question": "What is 15 + 27?", "ground_truth": "42"},
+            {"question": "If x + 5 = 12, what is x?", "ground_truth": "7"},
+            {"question": "What is 8 * 5?", "ground_truth": "40"},
         ]
     for i, q in enumerate(initial_questions):
-        question_store.add(Artifact(id=f"seed_{i}", data=q, weight=1.0))
+        question_store.add(Artifact(id=f"seed_{i}", data=q))
 
     arena.add_episode("propose", ProposerEpisode(n_solver_rollouts=n_solver_rollouts))
     arena.add_episode("solve", SolveEpisode())

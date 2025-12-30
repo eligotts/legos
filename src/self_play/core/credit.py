@@ -179,37 +179,43 @@ class GRPOCredit(CreditAssigner):
         if not results:
             return
 
-        rollouts = [r.rollout for r in results]
+        # Group results by episode type for per-type advantage computation.
+        groups: Dict[str, List[GenerateResult]] = {}
+        for result in results:
+            groups.setdefault(result.rollout.episode_type, []).append(result)
 
-        # Get role keys (validates consistency across rollouts)
-        role_keys = _get_role_keys(rollouts)
+        for group_results in groups.values():
+            rollouts = [r.rollout for r in group_results]
 
-        if not role_keys:
-            # No rewards set - assign 0 to all steps
-            for result in results:
-                rollout = result.rollout
-                for i, _ in enumerate(rollout.steps):
-                    weights[(rollout.id, i)] = 0.0
-        else:
-            # Compute advantages per role
-            role_advantages: Dict[str, List[float]] = {}
-            for role_id in role_keys:
-                rewards = [r.rewards.get(role_id, 0.0) for r in rollouts]
-                role_advantages[role_id] = _compute_grpo_advantages(
-                    rewards, self.normalize, self.positive_only
-                )
+            # Get role keys (validates consistency across rollouts)
+            role_keys = _get_role_keys(rollouts)
 
-            # Assign advantage to each step based on step's role_id
-            for idx, result in enumerate(results):
-                rollout = result.rollout
-                for i, step in enumerate(rollout.steps):
-                    # Get advantage for this step's role
-                    if step.role_id in role_advantages:
-                        adv = role_advantages[step.role_id][idx]
-                    else:
-                        # Step's role not in rewards dict - use 0
-                        adv = 0.0
-                    weights[(rollout.id, i)] = adv
+            if not role_keys:
+                # No rewards set - assign 0 to all steps
+                for result in group_results:
+                    rollout = result.rollout
+                    for i, _ in enumerate(rollout.steps):
+                        weights[(rollout.id, i)] = 0.0
+            else:
+                # Compute advantages per role
+                role_advantages: Dict[str, List[float]] = {}
+                for role_id in role_keys:
+                    rewards = [r.rewards.get(role_id, 0.0) for r in rollouts]
+                    role_advantages[role_id] = _compute_grpo_advantages(
+                        rewards, self.normalize, self.positive_only
+                    )
+
+                # Assign advantage to each step based on step's role_id
+                for idx, result in enumerate(group_results):
+                    rollout = result.rollout
+                    for i, step in enumerate(rollout.steps):
+                        # Get advantage for this step's role
+                        if step.role_id in role_advantages:
+                            adv = role_advantages[step.role_id][idx]
+                        else:
+                            # Step's role not in rewards dict - use 0
+                            adv = 0.0
+                        weights[(rollout.id, i)] = adv
 
         # Recurse into children (each parent's children form independent groups)
         for result in results:

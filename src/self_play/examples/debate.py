@@ -7,7 +7,7 @@ This example demonstrates:
 - LLM judge as rubric (NOT a trainable role)
 
 Debate Structure:
-1. Topic is selected from seed
+1. Topic is selected from artifact
 2. Aff and Neg alternate for N rounds
 3. Rubric calls LLM to judge and scores zero-sum
 """
@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Tuple
 
 from ..core import (
     Role,
-    Messages,
     Rollout,
     EpisodeState,
     AlternatingRolesEpisode,
@@ -50,9 +49,23 @@ Evaluate based on:
 Respond with JSON: {{"winner": "{aff_role}" or "{neg_role}", "score": <0.0-1.0>, "reasoning": "<brief explanation>"}}"""
 
     async def llm_judge(rollout: Rollout, arena: Arena) -> Dict[str, float]:
-        # Build transcript from steps
-        lines = [f"[{step.role_id}]: {step.completion_text}" for step in rollout.steps]
-        transcript = "\n\n".join(lines)
+        if not rollout.steps:
+            return {aff_role: 0.0, neg_role: 0.0}
+
+        # The final step's prompt contains the full history (built by run_chat_loop)
+        # Extract it from the "user" message, then append the final completion
+        final_step = rollout.steps[-1]
+
+        # Get history from final step's prompt (the user message content)
+        history = ""
+        for msg in final_step.prompt:
+            if msg.get("role") == "user":
+                history = msg.get("content", "")
+                break
+
+        # Build full transcript: history + final completion
+        # History already has format "Topic: ...\n\n{role}: {text}\n\n{role}: {text}..."
+        transcript = history + f"\n\n{final_step.role_id}: {final_step.completion_text}"
 
         # Call LLM judge (not tracked for training - no role_id)
         response = await arena.call_model(
@@ -124,24 +137,14 @@ class DebateEpisode(AlternatingRolesEpisode):
         arena: Arena,
         artifact: Any,
         state: EpisodeState,
-    ) -> Messages:
+    ) -> str:
         topic = artifact.get("topic", "Unknown topic")
-        role = arena.roles[self.aff_role_id]
+        state.data["topic"] = topic
 
-        messages: Messages = []
-        if role.system_prompt:
-            messages.append({"role": "system", "content": role.system_prompt})
-
-        messages.append({
-            "role": "user",
-            "content": f"""Topic: {topic}
+        return f"""Topic: {topic}
 
 You are arguing for the affirmative side.
 This is your opening statement. Present your main argument."""
-        })
-
-        state.data["topic"] = topic
-        return messages
 
     async def env_response(
         self,
@@ -150,7 +153,7 @@ This is your opening statement. Present your main argument."""
         artifact: Any,
     ) -> str:
         """Return transition text for next speaker."""
-        next_role_id = self.roles[state.turn % 2]
+        next_role_id = self.get_next_actor(state, artifact)
         side = "affirmative" if next_role_id == self.aff_role_id else "negative"
         return f"You are arguing for the {side} side. Respond to your opponent's points."
 
@@ -178,7 +181,11 @@ class DebateArena(Arena):
 
         topics = self.stores["topics"].sample(k=self.batch_size)
         return [
-            EpisodeRequest(episode_type="debate", seed=topic.data)
+            EpisodeRequest(
+                episode_type="debate",
+                artifact=topic.data,
+                meta={"artifact_id": topic.id},
+            )
             for topic in topics
         ]
 
