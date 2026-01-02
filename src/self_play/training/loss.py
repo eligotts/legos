@@ -160,13 +160,18 @@ def make_loss_fn(
 
     The returned function takes (model, batch_data) and returns (loss, metrics).
 
+    IMPORTANT: nn.value_and_grad differentiates with respect to the FIRST returned
+    value, but passes through all return values. So if this returns (loss, metrics),
+    value_and_grad returns ((loss, metrics), grads). This allows us to get both
+    loss and metrics in a single forward pass.
+
     Args:
         use_importance_sampling: Whether to do forward pass and compute importance ratio
         clip_low: Lower bound for importance ratio clipping
         clip_high: Upper bound for importance ratio clipping
 
     Returns:
-        A loss function compatible with nn.value_and_grad
+        A loss function compatible with nn.value_and_grad that returns (loss, metrics)
     """
     def loss_fn(
         model: nn.Module,
@@ -174,8 +179,8 @@ def make_loss_fn(
         inference_logprobs: mx.array,
         advantages: mx.array,
         loss_mask: mx.array,
-    ) -> mx.array:
-        loss, _ = compute_loss(
+    ) -> Tuple[mx.array, Dict[str, mx.array]]:
+        loss, metrics = compute_loss(
             model=model,
             input_ids=input_ids,
             inference_logprobs=inference_logprobs,
@@ -185,6 +190,7 @@ def make_loss_fn(
             clip_low=clip_low,
             clip_high=clip_high,
         )
-        return loss
+        # Return (loss, metrics) - value_and_grad diffs w.r.t. loss, passes through metrics
+        return loss, metrics
 
     return loss_fn

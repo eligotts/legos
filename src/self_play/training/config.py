@@ -43,3 +43,8 @@ class TrainerConfig:
 
     # Logging verbosity
     verbose: bool = False
+
+    # Memory management: eval after each micro-batch to free memory
+    # Set to True for memory-constrained systems (like MacBook)
+    # Set to False for systems with lots of VRAM (batched eval is faster)
+    eval_per_micro_batch: bool = True

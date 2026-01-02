@@ -82,20 +82,23 @@ class OpenAIClient(InferenceClient):
         self._call_count = 0
 
     @classmethod
-    def for_local(cls, port: int = 8000, timeout: float = 120.0) -> "OpenAIClient":
+    def for_local(
+        cls, host: str = "localhost", port: int = 8000, timeout: float = 120.0
+    ) -> "OpenAIClient":
         """Create a client for a local OpenAI-compatible server (e.g., mlx-vllm).
 
         Args:
+            host: The host the server is running on (default: localhost)
             port: The port the server is running on (default: 8000)
             timeout: Request timeout in seconds (default: 120s for local inference)
 
         Returns:
-            OpenAIClient configured for localhost
+            OpenAIClient configured for the server
         """
         return cls(
             api_key="not-needed",
             model="local",
-            base_url=f"http://localhost:{port}/v1",
+            base_url=f"http://{host}:{port}/v1",
             timeout=timeout,
         )
 

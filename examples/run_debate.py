@@ -83,6 +83,18 @@ def parse_args():
         help="Use local mlx-vllm server at localhost:8000",
     )
     parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="Full base URL of local server (overrides host/port)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Local server host (default: localhost)",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=8000,
@@ -136,8 +148,17 @@ async def run_debate(args):
 
     # Initialize client
     if args.local:
-        client = OpenAIClient.for_local(port=args.port, timeout=240.0)
-        model_name = f"local (port {args.port})"
+        if args.url:
+            client = OpenAIClient(
+                api_key="not-needed",
+                model="local",
+                base_url=f"{args.url.rstrip('/')}/v1",
+                timeout=240.0,
+            )
+            model_name = f"local ({args.url})"
+        else:
+            client = OpenAIClient.for_local(host=args.host, port=args.port, timeout=240.0)
+            model_name = f"local ({args.host}:{args.port})"
     else:
         client = OpenAIClient.for_openrouter(api_key=args.api_key, model=args.model)
         model_name = args.model

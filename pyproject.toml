@@ -5,6 +5,7 @@ description = "A modular self-play LLM RL engine with clean abstractions"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.25",
+    "openai>=2.14.0",
 ]
 
 [project.optional-dependencies]

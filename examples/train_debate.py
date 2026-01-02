@@ -101,9 +101,21 @@ async def main(args):
         "Childhood social media use should be heavily restricted by law",
     ]
 
+    # Setup inference server URL
+    base_url = args.url if args.url else f"http://{args.host}:{args.port}"
+    print(f"\nConnecting to inference server at {base_url}...")
+
     # Setup inference client
-    print(f"\nConnecting to inference server at localhost:{args.port}...")
-    client = OpenAIClient.for_local(port=args.port, timeout=120.0)
+    # If a full URL is provided, we need to handle it differently than the host/port style
+    if args.url:
+        client = OpenAIClient(
+            api_key="not-needed",
+            model="local",
+            base_url=f"{base_url.rstrip('/')}/v1",
+            timeout=120.0,
+        )
+    else:
+        client = OpenAIClient.for_local(host=args.host, port=args.port, timeout=120.0)
 
     # Setup arena
     print("Setting up debate arena...")
@@ -134,14 +146,14 @@ async def main(args):
         use_importance_sampling=args.use_importance_sampling,
         clip_low=0.8,
         clip_high=1.2,
-        weight_push_url=f"http://localhost:{args.port}",
+        weight_push_url=base_url,
         pad_token_id=tokenizer.pad_token_id or 0,
         verbose=args.verbose,
     )
 
     # Setup weight publisher
     publisher = WeightPublisher(
-        base_url=f"http://localhost:{args.port}",
+        base_url=base_url,
     )
 
     # Setup trainer
@@ -203,13 +215,15 @@ if __name__ == "__main__":
     parser.add_argument("--lora-layers", type=int, default=16, help="LoRA layers")
 
     # Server args
+    parser.add_argument("--url", type=str, default=None, help="Full base URL of inference server (overrides host/port)")
+    parser.add_argument("--host", type=str, default="localhost", help="Inference server host")
     parser.add_argument("--port", type=int, default=8000, help="Inference server port")
 
     # Training args
     parser.add_argument("--num-steps", type=int, default=10, help="Number of training steps")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=4, help="Debates per arena step")
-    parser.add_argument("--train-batch-size", type=int, default=32, help="Records per train step")
+    parser.add_argument("--train-batch-size", type=int, default=24, help="Records per train step")
     parser.add_argument("--micro-token-budget", type=int, default=4096, help="Tokens per micro-batch")
     parser.add_argument("--max-policy-lag", type=int, default=3, help="Max staleness (steps)")
     parser.add_argument("--concurrency", type=int, default=4, help="Max concurrent episodes")

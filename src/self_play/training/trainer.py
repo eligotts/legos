@@ -10,7 +10,9 @@ The Trainer orchestrates:
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import asyncio
+import time
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,8 +22,26 @@ from ..core.arena import TrainingBatch
 from ..core.types import TrainingRecord
 from .config import TrainerConfig
 from .batching import split_by_token_budget, collate
-from .loss import compute_loss, make_loss_fn
+from .loss import make_loss_fn
 from .weight_publisher import WeightPublisher
+
+
+class Timer:
+    """Simple context manager for timing code blocks."""
+
+    def __init__(self, name: str, timings: dict):
+        self.name = name
+        self.timings = timings
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        elapsed = time.perf_counter() - self.start
+        if self.name not in self.timings:
+            self.timings[self.name] = []
+        self.timings[self.name].append(elapsed)
 
 
 class Trainer:
@@ -96,83 +116,98 @@ class Trainer:
                 fresh.append(r)
         return fresh
 
-    async def train_step(
+    def _train_step_sync(
         self,
-        batch: TrainingBatch,
-    ) -> Dict[str, float]:
+        fresh_records: List[TrainingRecord],
+        verbose: bool = False,
+    ) -> Tuple[Dict[str, float], int]:
         """
-        Execute one training step with gradient accumulation.
+        Synchronous training step - runs in a separate thread.
+
+        This contains all the CPU/GPU-bound MLX work that would otherwise
+        block the asyncio event loop.
 
         Args:
-            batch: TrainingBatch containing records to train on
+            fresh_records: Pre-filtered list of fresh training records
+            verbose: Print debug info
 
         Returns:
-            Dictionary of metrics (loss, tokens, records, stale_dropped, etc.)
+            Tuple of (metrics dict, new train_step_idx)
         """
-        self.model.train()
+        step_start = time.perf_counter()
+        timings: Dict[str, list] = {}
 
-        # 1. Filter stale records
-        fresh_records = self.filter_stale_records(batch.records)
-        stale_count = len(batch.records) - len(fresh_records)
+        # Set memory limit (like GRPO trainer does) - helps with memory pressure
+        try:
+            mx.set_wired_limit(mx.metal.device_info()["max_recommended_working_set_size"])
+        except Exception:
+            pass  # May not be available on all systems
 
-        if not fresh_records:
-            return {
-                "skipped": 1,
-                "stale_dropped": stale_count,
-                "records": 0,
-            }
+        # Split into micro-batches by token budget
+        with Timer("split_batches", timings):
+            micro_batches = split_by_token_budget(
+                fresh_records,
+                self.config.micro_token_budget,
+            )
 
-        # 2. Split into micro-batches by token budget
-        micro_batches = split_by_token_budget(
-            fresh_records,
-            self.config.micro_token_budget,
-        )
+        if verbose:
+            total_tokens_preview = sum(len(r.completion_token_ids) for r in fresh_records)
+            total_input_tokens = sum(len(r.input_ids) for r in fresh_records)
+            print(f"  → {len(fresh_records)} fresh records, {total_tokens_preview} completion tokens, "
+                  f"{total_input_tokens} total input tokens → {len(micro_batches)} micro-batches")
 
-        # 3. Gradient accumulation loop
-        # We weight each micro-batch by its record proportion to ensure
-        # each record contributes equally to the final gradient, regardless
-        # of which micro-batch it landed in (per-record equality).
+        # Gradient accumulation loop
         accumulated_grads = None
-        total_loss = 0.0
         total_tokens = 0
-        total_clip_fraction = 0.0
-        total_kl = 0.0
         total_records = len(fresh_records)
+
+        # Track lazy losses/metrics for batched eval at the end
+        micro_losses = []  # List of (loss, num_records)
+        micro_metrics = []  # List of (metrics_dict, num_records)
 
         # Create value_and_grad function
         loss_and_grad_fn = nn.value_and_grad(self.model, self._loss_fn)
 
-        for micro in micro_batches:
+        for micro_idx, micro in enumerate(micro_batches):
+            micro_start = time.perf_counter()
+            micro_timings: Dict[str, float] = {}
+
             # Collate into tensors
+            t0 = time.perf_counter()
             input_ids, loss_mask, inference_logprobs, advantages = collate(
                 micro,
                 pad_token_id=self.config.pad_token_id,
             )
+            micro_timings["collate"] = time.perf_counter() - t0
 
-            # Compute loss and gradients
-            loss, grads = loss_and_grad_fn(
+            # Log tensor shapes for debugging
+            if verbose:
+                seq_lengths = [len(r.input_ids) for r in micro]
+                print(f"    [micro {micro_idx + 1}] input_ids shape: {input_ids.shape}, "
+                      f"records: {len(micro)}, "
+                      f"seq_lens: min={min(seq_lengths)}, max={max(seq_lengths)}, avg={sum(seq_lengths)/len(seq_lengths):.0f}")
+
+            # Compute loss, metrics, and gradients in a SINGLE forward pass
+            # nn.value_and_grad diffs w.r.t. first return value (loss), passes through rest (metrics)
+            # Returns ((loss, metrics), grads)
+            t0 = time.perf_counter()
+            (loss, metrics), grads = loss_and_grad_fn(
                 self.model,
                 input_ids,
                 inference_logprobs,
                 advantages,
                 loss_mask,
             )
+            micro_timings["loss_and_grad_lazy"] = time.perf_counter() - t0
 
-            # Compute metrics (separate call since value_and_grad only returns loss)
-            _, metrics = compute_loss(
-                model=self.model,
-                input_ids=input_ids,
-                inference_logprobs=inference_logprobs,
-                advantages=advantages,
-                loss_mask=loss_mask,
-                use_importance_sampling=self.config.use_importance_sampling,
-                clip_low=self.config.clip_low,
-                clip_high=self.config.clip_high,
-            )
+            # For memory-constrained systems: eval immediately to free activations
+            if self.config.eval_per_micro_batch:
+                t0 = time.perf_counter()
+                mx.eval(loss, metrics["clip_fraction"], metrics["kl"], grads)
+                micro_timings["eval"] = time.perf_counter() - t0
 
             # Accumulate gradients weighted by record proportion
-            # This ensures each record contributes equally to the final gradient
-            # I think this is GSPO? And goes against DAPO which is token-level averaging?
+            t0 = time.perf_counter()
             weight = len(micro) / total_records
             if accumulated_grads is None:
                 accumulated_grads = tree_map(lambda g: g * weight, grads)
@@ -182,45 +217,196 @@ class Trainer:
                     accumulated_grads,
                     grads,
                 )
+            micro_timings["grad_accumulate"] = time.perf_counter() - t0
 
-            # Accumulate metrics
+            # Track metrics
             micro_tokens = sum(len(r.completion_token_ids) for r in micro)
-            total_loss += float(loss.item()) * len(micro)
+            micro_losses.append((loss, len(micro)))
+            micro_metrics.append((metrics, len(micro)))
             total_tokens += micro_tokens
-            total_clip_fraction += float(metrics["clip_fraction"].item()) * len(micro)
-            total_kl += float(metrics["kl"].item()) * len(micro)
 
-            # Clear cache after each micro-batch
-            mx.clear_cache()
+            # Clear cache after each micro-batch to free memory
+            if self.config.eval_per_micro_batch:
+                t0 = time.perf_counter()
+                mx.clear_cache()
+                micro_timings["clear_cache"] = time.perf_counter() - t0
 
-        # 4. Optimizer step (gradients already properly weighted)
+            micro_total = time.perf_counter() - micro_start
+
+            if verbose:
+                micro_loss = float(loss.item()) if self.config.eval_per_micro_batch else 0
+                micro_kl = float(metrics["kl"].item()) if self.config.eval_per_micro_batch else 0
+                micro_clip = float(metrics["clip_fraction"].item()) if self.config.eval_per_micro_batch else 0
+                print(f"    micro-batch {micro_idx + 1}/{len(micro_batches)}: "
+                      f"{len(micro)} records, {micro_tokens} completion_tokens, "
+                      f"loss={micro_loss:.4f}, kl={micro_kl:.4f}, clip={micro_clip:.2%}")
+                if self.config.eval_per_micro_batch:
+                    print(f"      ⏱️  collate={micro_timings['collate']*1000:.1f}ms, "
+                          f"fwd+bwd(lazy)={micro_timings['loss_and_grad_lazy']*1000:.1f}ms, "
+                          f"eval={micro_timings['eval']*1000:.1f}ms, "
+                          f"accum={micro_timings['grad_accumulate']*1000:.1f}ms, "
+                          f"clear={micro_timings['clear_cache']*1000:.1f}ms, "
+                          f"TOTAL={micro_total*1000:.1f}ms")
+                else:
+                    print(f"      ⏱️  collate={micro_timings['collate']*1000:.1f}ms, "
+                          f"fwd+bwd(lazy)={micro_timings['loss_and_grad_lazy']*1000:.1f}ms, "
+                          f"accum(lazy)={micro_timings['grad_accumulate']*1000:.1f}ms, "
+                          f"TOTAL={micro_total*1000:.1f}ms")
+
+        # Optimizer step
+        t0 = time.perf_counter()
         self.optimizer.update(self.model, accumulated_grads)
+        optimizer_update_time = time.perf_counter() - t0
 
-        # 5. Evaluate to materialize updated parameters
-        mx.eval(self.model.parameters())
+        if verbose:
+            print(f"  → optimizer update: {optimizer_update_time*1000:.1f}ms")
 
-        # 6. Increment step counter
+        # Evaluate model parameters (and losses/metrics if not done per-micro-batch)
+        t0 = time.perf_counter()
+        if self.config.eval_per_micro_batch:
+            # Already evaluated losses/metrics per micro-batch, just need to eval model params
+            mx.eval(self.model.parameters())
+        else:
+            # Batch eval: model params + all losses + all metrics
+            all_losses = [loss for loss, _ in micro_losses]
+            all_clip_fracs = [m["clip_fraction"] for m, _ in micro_metrics]
+            all_kls = [m["kl"] for m, _ in micro_metrics]
+            mx.eval(self.model.parameters(), *all_losses, *all_clip_fracs, *all_kls)
+        eval_time = time.perf_counter() - t0
+
+        if verbose:
+            try:
+                peak_mem_gb = mx.get_peak_memory() / 1e9
+                active_mem_gb = mx.get_active_memory() / 1e9
+                print(f"  → final eval (params): {eval_time*1000:.1f}ms ({eval_time:.2f}s)")
+                print(f"  → memory: peak={peak_mem_gb:.2f}GB, active={active_mem_gb:.2f}GB")
+            except Exception:
+                print(f"  → final eval (params): {eval_time*1000:.1f}ms ({eval_time:.2f}s)")
+
+        # Extract scalar values (arrays should already be materialized if eval_per_micro_batch)
+        total_loss = sum(float(loss.item()) * n for loss, n in micro_losses)
+        total_clip_fraction = sum(float(m["clip_fraction"].item()) * n for m, n in micro_metrics)
+        total_kl = sum(float(m["kl"].item()) * n for m, n in micro_metrics)
+
+        # Clear cache
+        t0 = time.perf_counter()
+        mx.clear_cache()
+        clear_cache_time = time.perf_counter() - t0
+
+        if verbose:
+            print(f"  → clear_cache: {clear_cache_time*1000:.1f}ms")
+
+        # Increment step counter
         self.train_step_idx += 1
 
-        # 7. Push weights to inference server (if publisher configured)
+        step_total = time.perf_counter() - step_start
+
+        # Compute averages
+        num_fresh = len(fresh_records)
+        avg_loss = total_loss / num_fresh
+        avg_kl = total_kl / num_fresh
+        avg_clip = total_clip_fraction / num_fresh
+
+        if verbose:
+            print(f"  → step complete: avg_loss={avg_loss:.4f}, avg_kl={avg_kl:.4f}, "
+                  f"clip={avg_clip:.2%}, TOTAL TIME={step_total:.2f}s")
+
+        # Return metrics
+        return {
+            "loss": avg_loss,
+            "tokens": total_tokens,
+            "records": num_fresh,
+            "clip_fraction": avg_clip,
+            "kl": avg_kl,
+            "train_step": self.train_step_idx,
+            "step_time_s": step_total,
+        }, self.train_step_idx
+
+    async def train_step(
+        self,
+        batch: TrainingBatch,
+    ) -> Dict[str, float]:
+        """
+        Execute one training step with gradient accumulation.
+
+        The CPU/GPU-bound MLX work runs in a separate thread via asyncio.to_thread()
+        to avoid blocking the event loop, allowing generation to proceed in parallel.
+
+        Args:
+            batch: TrainingBatch containing records to train on
+
+        Returns:
+            Dictionary of metrics (loss, tokens, records, stale_dropped, etc.)
+        """
+        overall_start = time.perf_counter()
+        self.model.train()
+        verbose = self.config.verbose
+
+        if verbose:
+            print(f"\n[train_step {self.train_step_idx + 1}] starting with {len(batch.records)} records")
+
+        # 1. Filter stale records (cheap, do on main thread)
+        t0 = time.perf_counter()
+        fresh_records = self.filter_stale_records(batch.records)
+        stale_count = len(batch.records) - len(fresh_records)
+        filter_time = time.perf_counter() - t0
+
+        if verbose and stale_count > 0:
+            print(f"  → filtered out {stale_count} stale records (policy lag > {self.config.max_policy_lag})")
+
+        if not fresh_records:
+            if verbose:
+                print(f"  → skipping step (all records stale)")
+            return {
+                "skipped": 1,
+                "stale_dropped": stale_count,
+                "records": 0,
+            }
+
+        # 2. Run CPU/GPU-bound training in a separate thread
+        # This allows the asyncio event loop to continue processing other tasks
+        # (like generation HTTP requests) while training runs
+        if verbose:
+            print(f"  → dispatching to training thread...")
+        t0 = time.perf_counter()
+        metrics, new_step_idx = await asyncio.to_thread(
+            self._train_step_sync,
+            fresh_records,
+            verbose,
+        )
+        training_time = time.perf_counter() - t0
+        metrics["stale_dropped"] = stale_count
+
+        # 3. Push weights to inference server (async HTTP, stays on main thread)
+        publish_time = 0.0
         if self.publisher is not None:
+            if verbose:
+                print(f"  → publishing weights (version {new_step_idx}) to {self.publisher.base_url}...")
+            t0 = time.perf_counter()
             try:
                 await self.publisher.publish(
                     self.model,
-                    version=self.train_step_idx,
+                    version=new_step_idx,
+                    verbose=verbose,
                 )
+                publish_time = time.perf_counter() - t0
+                if verbose:
+                    print(f"  → weights published successfully in {publish_time*1000:.1f}ms")
             except Exception as e:
-                if self.config.verbose:
-                    print(f"[trainer] failed to publish weights: {e}")
+                publish_time = time.perf_counter() - t0
+                if verbose:
+                    print(f"  → failed to publish weights after {publish_time*1000:.1f}ms: {e}")
 
-        # 8. Return metrics
-        num_fresh = len(fresh_records)
-        return {
-            "loss": total_loss / num_fresh,
-            "tokens": total_tokens,
-            "records": num_fresh,
-            "stale_dropped": stale_count,
-            "clip_fraction": total_clip_fraction / num_fresh,
-            "kl": total_kl / num_fresh,
-            "train_step": self.train_step_idx,
-        }
+        overall_time = time.perf_counter() - overall_start
+        if verbose:
+            print(f"  ════════════════════════════════════════════════════════")
+            print(f"  TIMING SUMMARY: filter={filter_time*1000:.1f}ms, "
+                  f"training={training_time*1000:.1f}ms, "
+                  f"publish={publish_time*1000:.1f}ms, "
+                  f"TOTAL={overall_time*1000:.1f}ms")
+            print(f"  ════════════════════════════════════════════════════════")
+
+        metrics["overall_time_s"] = overall_time
+        metrics["publish_time_s"] = publish_time
+
+        return metrics

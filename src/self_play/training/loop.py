@@ -41,23 +41,22 @@ async def training_loop(
         concurrency: Max concurrent episodes during generation
         verbose: Print debug info
     """
-    generation_step = 0
     shutdown = asyncio.Event()
 
     async def generator_loop():
         """Generate rollouts and push to queue."""
-        nonlocal generation_step
+        batches_generated = 0  # For logging only, not control flow
 
-        while not shutdown.is_set() and generation_step < num_steps:
+        while not shutdown.is_set():
             try:
                 batch = await arena.step(concurrency=concurrency, verbose=verbose)
 
                 if batch.records:
-                    await batch_queue.put(batch)
-                    generation_step += 1
+                    await batch_queue.put(batch)  # Blocks if queue full (backpressure)
+                    batches_generated += 1
 
                     if verbose:
-                        print(f"[generator] step {generation_step}: {len(batch.records)} records")
+                        print(f"[generator] batch {batches_generated}: {len(batch.records)} records")
 
             except Exception as e:
                 if verbose:
@@ -65,7 +64,7 @@ async def training_loop(
                 # Continue generating despite errors
 
         if verbose:
-            print(f"[generator] finished after {generation_step} steps")
+            print(f"[generator] shutdown after {batches_generated} batches")
 
     async def trainer_loop():
         """Pull batches and train when we have enough records."""
