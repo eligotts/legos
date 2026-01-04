@@ -11,14 +11,11 @@ Core Concepts:
 
 Example Usage:
     from self_play import Arena, Role, MockInferenceClient
-    from self_play.examples import create_debate_arena
+    from self_play.tasks import DebateArena, DebateEpisode
 
     # Create arena with debate setup
-    arena = create_debate_arena(
-        client=MockInferenceClient(),
-        topics=["AI safety is more important than AI capabilities"],
-        num_rounds=3,
-    )
+    arena = DebateArena(client=MockInferenceClient(), batch_size=4)
+    arena.add_episode("debate", DebateEpisode(num_rounds=3))
 
     # Run a training step
     batch = await arena.step()

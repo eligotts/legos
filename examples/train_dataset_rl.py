@@ -32,7 +32,7 @@ from mlx_lm import load
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from self_play.core import OpenAIClient, Rollout, Arena, Role, Artifact, GRPOCredit
-from self_play.examples.dataset_rl import (
+from self_play.tasks.dataset_rl import (
     DatasetArena,
     DatasetEpisode,
 )

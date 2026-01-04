@@ -1,7 +1,7 @@
 """
-Example implementations demonstrating the self-play abstractions.
+Task implementations for the self-play engine.
 
-These examples show how to implement:
+These tasks demonstrate how to implement various self-play scenarios:
 1. Debate: Multi-turn, zero-sum competitive dialogue
 2. Proposer/Solver: AZR-style problem generation and solving
 3. Dataset RL: Standard RL with fixed datasets

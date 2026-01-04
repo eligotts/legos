@@ -26,7 +26,7 @@ from mlx_lm import load
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from self_play.core import OpenAIClient, Role, Artifact, GRPOCredit
-from self_play.examples.debate import DebateArena, DebateEpisode
+from self_play.tasks.debate import DebateArena, DebateEpisode
 from self_play.training import (
     Trainer,
     TrainerConfig,

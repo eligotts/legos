@@ -29,7 +29,7 @@ from mlx_lm import load
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from self_play.core import OpenAIClient, Role, Artifact
-from self_play.examples.proposer_solver import ProposerSolverArena, ProposerEpisode, SolveEpisode
+from self_play.tasks.proposer_solver import ProposerSolverArena, ProposerEpisode, SolveEpisode
 from self_play.training import (
     Trainer,
     TrainerConfig,
