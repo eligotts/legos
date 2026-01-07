@@ -151,6 +151,17 @@ class EloMatchEpisode(Episode):
             response = await self.call_model(role_id, prompt, arena)
             state.data[f"response{i}"] = response.text
 
+            # Create Step and append to trajectory for training
+            step = Step(
+                role_id=role_id,
+                prompt=prompt,
+                completion=response.completion,
+                prompt_token_ids=response.prompt_token_ids,
+                completion_token_ids=response.completion_token_ids,
+                completion_logprobs=response.completion_logprobs,
+            )
+            state.trajectory.append(step)
+
         state.done = True
         return state
 
@@ -226,7 +237,7 @@ class ChallengeProposerEpisode(Episode):
 
         if new_challenge and new_challenge.get("challenge"):
             if "challenges" in arena.stores:
-                challenge_id = f"gen_{len(arena.stores['challenges'].artifacts)}"
+                challenge_id = f"gen_{arena.stores['challenges'].count()}"
                 arena.stores["challenges"].add(Artifact(
                     id=challenge_id,
                     data=new_challenge,

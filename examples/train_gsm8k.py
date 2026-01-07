@@ -39,19 +39,24 @@ from self_play.training import (
 
 def load_model_with_lora(
     model_path: str,
-    lora_rank: int = 8,
+    lora_rank: int = 16,
     lora_layers: int = 16,
-    lora_scale: float = 20.0,
+    lora_scale: float = 32.0,
+    lora_dropout: float = 0.05,
 ):
     """Load model and attach LoRA adapters."""
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers})...")
+    # Defaults match official LiquidAI/PEFT recommendations
+    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
+
+    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
     lora_config = {
         "rank": lora_rank,
         "scale": lora_scale,
-        "dropout": 0.0,
+        "dropout": lora_dropout,
+        "keys": lora_keys,
     }
     linear_to_lora_layers(model, lora_layers, lora_config)
 
@@ -263,7 +268,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str,
         # default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit")
         default="/Users/eligottlieb/.lmstudio/models/mlx-community/Qwen3-0.6B-8bit")
-    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-layers", type=int, default=16)
 
     # Server

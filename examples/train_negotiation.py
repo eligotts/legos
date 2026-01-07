@@ -101,9 +101,10 @@ IMPORTANT:
 
 def load_model_with_lora(
     model_path: str,
-    lora_rank: int = 8,
+    lora_rank: int = 16,
     lora_layers: int = 16,
-    lora_scale: float = 20.0,
+    lora_scale: float = 32.0,
+    lora_dropout: float = 0.05,
 ):
     """
     Load model and attach LoRA adapters.
@@ -112,7 +113,8 @@ def load_model_with_lora(
         model_path: Path to the base model
         lora_rank: LoRA rank (must match server config)
         lora_layers: Number of layers to apply LoRA to
-        lora_scale: LoRA scaling factor
+        lora_scale: LoRA scaling factor (lora_alpha in PEFT)
+        lora_dropout: LoRA dropout
 
     Returns:
         Tuple of (model, tokenizer)
@@ -120,11 +122,15 @@ def load_model_with_lora(
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers})...")
+    # Defaults match official LiquidAI/PEFT recommendations
+    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
+
+    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
     lora_config = {
         "rank": lora_rank,
         "scale": lora_scale,
-        "dropout": 0.0,
+        "dropout": lora_dropout,
+        "keys": lora_keys,
     }
     linear_to_lora_layers(model, lora_layers, lora_config)
 
@@ -398,7 +404,7 @@ if __name__ == "__main__":
         default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit",
         help="Path to the base model",
     )
-    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank")
     parser.add_argument("--lora-layers", type=int, default=16, help="LoRA layers")
 
     # Server args

@@ -42,20 +42,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if config.lora_rank is not None:
         from mlx_lm.tuner.utils import linear_to_lora_layers
 
+        # Default to attention-only layers (matches official LiquidAI/PEFT approach)
+        default_keys = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"]
+        lora_keys = config.lora_keys if config.lora_keys is not None else default_keys
+
         lora_config = {
             "rank": config.lora_rank,
             "scale": config.lora_scale,
-            "dropout": 0.0,
+            "dropout": 0.0,  # No dropout for inference
+            "keys": set(lora_keys),
         }
         linear_to_lora_layers(model, config.lora_layers, lora_config)
         model.eval()
-        print(f"LoRA initialized: rank={config.lora_rank}, layers={config.lora_layers}")
+        print(f"LoRA initialized: rank={config.lora_rank}, layers={config.lora_layers}, keys={lora_keys}")
 
     engine = AsyncEngine(
         model=model,
         tokenizer=tokenizer,
         max_batch_size=config.max_batch_size,
         default_max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        top_p=config.top_p,
+        top_k=config.top_k,
+        repetition_penalty=config.repetition_penalty,
     )
     await engine.start()
     print("Engine started")

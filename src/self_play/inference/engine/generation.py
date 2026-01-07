@@ -7,7 +7,7 @@ from typing import Literal
 import mlx.core as mx
 
 from mlx_lm.generate import BatchGenerator
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import make_repetition_penalty, make_sampler
 
 
 def _patch_arrays_cache():
@@ -85,6 +85,10 @@ class ContinuousBatchingEngine:
         max_batch_size: int = 32,
         default_max_tokens: int = 1024,
         extra_stop_tokens: set[int] | None = None,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        repetition_penalty: float = 1.0,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -103,13 +107,27 @@ class ContinuousBatchingEngine:
             stop_tokens |= extra_stop_tokens
         self.stop_tokens = stop_tokens
 
+        # Build sampler with configured params
+        # top_k=0 means disabled in mlx_lm, we use -1 externally for clarity
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p if top_p < 1.0 else 0.0,  # mlx_lm uses 0.0 to disable
+            top_k=top_k if top_k > 0 else 0,  # mlx_lm uses 0 to disable
+        )
+
+        # Build logits processors (repetition penalty)
+        logits_processors = None
+        if repetition_penalty != 1.0:
+            logits_processors = [make_repetition_penalty(repetition_penalty)]
+
         self._generator = BatchGenerator(
             model,
             max_tokens=default_max_tokens,
             stop_tokens=stop_tokens,
             completion_batch_size=max_batch_size,
             prefill_batch_size=1,
-            sampler=make_sampler(temp=0.7),
+            sampler=sampler,
+            logits_processors=logits_processors,
         )
 
     def add(self, prompt: list[int], max_tokens: int | None = None) -> int:

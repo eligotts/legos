@@ -45,6 +45,15 @@ def serve_command(args: argparse.Namespace) -> None:
         config_overrides["lora_layers"] = args.lora_layers
     if args.lora_scale:
         config_overrides["lora_scale"] = args.lora_scale
+    # Sampler args
+    if args.temperature is not None:
+        config_overrides["temperature"] = args.temperature
+    if args.top_p is not None:
+        config_overrides["top_p"] = args.top_p
+    if args.top_k is not None:
+        config_overrides["top_k"] = args.top_k
+    if args.repetition_penalty is not None:
+        config_overrides["repetition_penalty"] = args.repetition_penalty
 
     config = ServerConfig(**config_overrides)
     set_config(config)
@@ -54,6 +63,7 @@ def serve_command(args: argparse.Namespace) -> None:
     print(f"  Host: {config.host}:{config.port}")
     print(f"  Max batch size: {config.max_batch_size}")
     print(f"  Default max tokens: {config.max_tokens}")
+    print(f"  Sampler: temp={config.temperature}, top_p={config.top_p}, top_k={config.top_k}, rep_penalty={config.repetition_penalty}")
     if config.lora_rank:
         print(f"  LoRA: rank={config.lora_rank}, layers={config.lora_layers}, scale={config.lora_scale}")
 
@@ -135,6 +145,31 @@ For more information, see: https://github.com/eligottlieb/self-play-engine
         type=float,
         default=None,
         help="LoRA scaling factor (default: 20.0)",
+    )
+    # Sampler arguments
+    serve_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (default: 0.7)",
+    )
+    serve_parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p (nucleus) sampling (default: 1.0)",
+    )
+    serve_parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Top-k sampling, -1 to disable (default: -1)",
+    )
+    serve_parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Repetition penalty, 1.0 = none, >1.0 penalizes (default: 1.0)",
     )
 
     args = parser.parse_args()

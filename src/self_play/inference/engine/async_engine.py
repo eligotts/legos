@@ -43,6 +43,10 @@ class AsyncEngine:
         tokenizer,
         max_batch_size: int = 32,
         default_max_tokens: int = 4096,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        repetition_penalty: float = 1.0,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -57,6 +61,10 @@ class AsyncEngine:
             max_batch_size=max_batch_size,
             default_max_tokens=default_max_tokens,
             extra_stop_tokens=extra_stop,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
         )
 
         # request_id -> (Future, prompt_token_count)

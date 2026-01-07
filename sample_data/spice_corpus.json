@@ -1,0 +1,62 @@
+[
+  {
+    "id": "doc_astronomy_1",
+    "title": "The Solar System",
+    "text": "The Solar System consists of the Sun and the objects that orbit it, including eight planets. The four inner planets (Mercury, Venus, Earth, Mars) are terrestrial, meaning they have solid rocky surfaces. The four outer planets (Jupiter, Saturn, Uranus, Neptune) are gas giants or ice giants. Jupiter is the largest planet with a mass more than twice that of all other planets combined. Saturn is famous for its prominent ring system made primarily of ice particles and rocky debris. Earth is the only planet known to harbor life and has one natural satellite, the Moon. Mars has the largest volcano in the solar system, Olympus Mons, which stands about 22 km high."
+  },
+  {
+    "id": "doc_biology_1",
+    "title": "Photosynthesis",
+    "text": "Photosynthesis is the process by which plants, algae, and some bacteria convert light energy into chemical energy. The process occurs primarily in the chloroplasts, using chlorophyll to capture sunlight. The basic equation is: 6CO2 + 6H2O + light energy -> C6H12O6 + 6O2. This means plants take in carbon dioxide and water, and produce glucose and oxygen. Photosynthesis has two stages: the light-dependent reactions and the Calvin cycle. The light-dependent reactions occur in the thylakoid membranes and produce ATP and NADPH. The Calvin cycle occurs in the stroma and uses ATP and NADPH to fix carbon dioxide into glucose."
+  },
+  {
+    "id": "doc_history_1",
+    "title": "The French Revolution",
+    "text": "The French Revolution began in 1789 and fundamentally transformed France from an absolute monarchy to a republic. The storming of the Bastille on July 14, 1789, is considered a pivotal moment and is now celebrated as French National Day. Key causes included financial crisis, food shortages, and resentment of the privileges enjoyed by the nobility and clergy. The revolution produced the Declaration of the Rights of Man and of the Citizen in August 1789. King Louis XVI was executed by guillotine in January 1793. The Reign of Terror (1793-1794) under Robespierre saw thousands executed as enemies of the revolution. Napoleon Bonaparte rose to power in the aftermath, eventually becoming Emperor in 1804."
+  },
+  {
+    "id": "doc_physics_1",
+    "title": "Newton's Laws of Motion",
+    "text": "Isaac Newton published his three laws of motion in 1687 in Principia Mathematica. The First Law (Law of Inertia) states that an object at rest stays at rest, and an object in motion stays in motion, unless acted upon by an external force. The Second Law states that force equals mass times acceleration (F = ma). The Third Law states that for every action, there is an equal and opposite reaction. These laws form the foundation of classical mechanics and accurately describe the motion of most everyday objects. The laws break down at very high speeds (where relativity applies) or very small scales (where quantum mechanics applies). Newton's laws enabled accurate predictions of planetary orbits and laid groundwork for engineering and physics."
+  },
+  {
+    "id": "doc_chemistry_1",
+    "title": "The Periodic Table",
+    "text": "The periodic table organizes chemical elements by atomic number, electron configuration, and recurring chemical properties. Dmitri Mendeleev published the first widely recognized periodic table in 1869. Elements are arranged in rows (periods) and columns (groups or families). Elements in the same group have similar chemical properties because they have the same number of valence electrons. Alkali metals (Group 1) are highly reactive, while noble gases (Group 18) are largely inert. The table has 118 confirmed elements, with elements 1-94 occurring naturally. Metals are found on the left side, nonmetals on the right, with metalloids along the dividing line."
+  },
+  {
+    "id": "doc_geography_1",
+    "title": "The Amazon Rainforest",
+    "text": "The Amazon Rainforest is the world's largest tropical rainforest, covering about 5.5 million square kilometers. It spans nine countries, with about 60% located in Brazil. The Amazon River, which flows through the forest, is the second longest river in the world and carries more water than any other river. The rainforest is home to approximately 10% of all species on Earth, including jaguars, pink river dolphins, and poison dart frogs. It produces about 20% of the world's oxygen, earning it the nickname \"Lungs of the Earth.\" Deforestation threatens the ecosystem, with about 17% of the forest lost in the last 50 years. Indigenous peoples have lived in the Amazon for thousands of years and continue to depend on it today."
+  },
+  {
+    "id": "doc_technology_1",
+    "title": "Machine Learning Basics",
+    "text": "Machine learning is a subset of artificial intelligence where systems learn patterns from data. There are three main types: supervised learning (with labeled data), unsupervised learning (finding patterns in unlabeled data), and reinforcement learning (learning through rewards and penalties). Neural networks are inspired by biological neurons and consist of layers of interconnected nodes. Deep learning refers to neural networks with many layers, enabling them to learn complex patterns. Common applications include image recognition, natural language processing, and recommendation systems. Overfitting occurs when a model learns the training data too well and fails to generalize. Techniques like regularization, dropout, and cross-validation help prevent overfitting."
+  },
+  {
+    "id": "doc_economics_1",
+    "title": "Supply and Demand",
+    "text": "Supply and demand is a fundamental economic model describing how prices are determined in a market. The law of demand states that as prices rise, quantity demanded falls, all else being equal. The law of supply states that as prices rise, quantity supplied increases, all else being equal. The equilibrium price is where supply and demand curves intersect. A shortage occurs when demand exceeds supply at a given price, pushing prices up. A surplus occurs when supply exceeds demand, pushing prices down. Shifts in either curve (due to factors like income changes or production costs) change the equilibrium."
+  },
+  {
+    "id": "doc_literature_1",
+    "title": "Shakespeare's Hamlet",
+    "text": "Hamlet is a tragedy written by William Shakespeare around 1600. The play is set in Denmark and follows Prince Hamlet as he seeks revenge against his uncle Claudius, who murdered Hamlet's father, took the throne, and married Hamlet's mother Gertrude. The ghost of Hamlet's father reveals the murder at the beginning of the play. Hamlet's famous soliloquy \"To be or not to be\" contemplates existence and death. The play explores themes of revenge, corruption, mortality, and madness. Major characters include Ophelia (Hamlet's love interest who goes mad and drowns), Polonius (her father, killed by Hamlet), and Laertes (her brother). The play ends with the deaths of Hamlet, Claudius, Gertrude, and Laertes."
+  },
+  {
+    "id": "doc_medicine_1",
+    "title": "The Human Immune System",
+    "text": "The immune system is the body's defense against infectious organisms and other invaders. It consists of two main parts: innate immunity (general, rapid response) and adaptive immunity (specific, learned response). White blood cells, or leukocytes, are the primary agents of immune response. B cells produce antibodies that neutralize pathogens. T cells directly attack infected cells and coordinate immune responses. Vaccines work by training the adaptive immune system to recognize specific pathogens without causing disease. Autoimmune disorders occur when the immune system mistakenly attacks the body's own tissues. Examples include rheumatoid arthritis, lupus, and type 1 diabetes."
+  },
+  {
+    "id": "doc_math_1",
+    "title": "The Pythagorean Theorem",
+    "text": "The Pythagorean theorem states that in a right triangle, the square of the hypotenuse equals the sum of the squares of the other two sides: a² + b² = c². The theorem is named after the ancient Greek mathematician Pythagoras, though it was known to Babylonians over 1000 years earlier. A Pythagorean triple consists of three positive integers a, b, and c that satisfy the equation, such as (3, 4, 5) and (5, 12, 13). The theorem has hundreds of different proofs, more than any other theorem. It forms the basis for calculating distances in Euclidean geometry and has applications in architecture, navigation, and computer graphics."
+  },
+  {
+    "id": "doc_music_1",
+    "title": "The Development of Jazz",
+    "text": "Jazz originated in New Orleans in the late 19th and early 20th centuries, blending African rhythms, blues, and European harmonies. Louis Armstrong became one of the first major jazz soloists in the 1920s, revolutionizing trumpet playing and vocal improvisation. The swing era of the 1930s and 1940s brought big bands led by Duke Ellington and Count Basie. Bebop emerged in the 1940s with Charlie Parker and Dizzy Gillespie, featuring faster tempos and complex harmonies. Miles Davis pioneered cool jazz in the 1950s and fusion in the 1960s. Key characteristics of jazz include improvisation, syncopation, and call-and-response patterns. Jazz has influenced virtually every form of popular music that followed."
+  }
+]

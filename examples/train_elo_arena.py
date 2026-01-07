@@ -58,12 +58,15 @@ Generate novel, engaging writing challenges that test creativity and skill.
 Make challenges specific, clear, and answerable in 1-3 sentences."""
 
 
-def load_model_with_lora(model_path: str, lora_rank: int = 8, lora_layers: int = 16):
+def load_model_with_lora(model_path: str, lora_rank: int = 16, lora_layers: int = 16):
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers})...")
-    linear_to_lora_layers(model, lora_layers, {"rank": lora_rank, "scale": 20.0, "dropout": 0.0})
+    # Defaults match official LiquidAI/PEFT recommendations
+    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
+
+    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
+    linear_to_lora_layers(model, lora_layers, {"rank": lora_rank, "scale": 32.0, "dropout": 0.05, "keys": lora_keys})
 
     trainable = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
     total = sum(p.size for _, p in tree_flatten(model.parameters()))
@@ -100,23 +103,31 @@ async def preview_elo_arena(arena, concurrency: int = 4):
         episode_type = meta.get("episode_type", "?")
 
         if episode_type == "elo_match":
-            winner = meta.get("winner", "?")
             challenge = meta.get("artifact", {}).get("challenge", "N/A") if meta.get("artifact") else "N/A"
-            elo_changes = meta.get("elo_changes", {})
+
+            # Get rewards per role from records
+            role_rewards = {r.role_id: r.reward for r in data["records"]}
+            role_advantages = {r.role_id: r.advantage for r in data["records"]}
+
+            # Determine winner from rewards
+            if role_rewards:
+                max_reward = max(role_rewards.values())
+                if max_reward > 0:
+                    winner = [k for k, v in role_rewards.items() if v == max_reward][0]
+                elif max_reward == 0:
+                    winner = "Tie"
+                else:
+                    winner = "?"
+            else:
+                winner = "?"
 
             print(f"[{i}] EloMatch | Winner: {winner}")
             print(f"    Challenge: {truncate(challenge, 60)}")
 
-            # Show Elo changes
-            if elo_changes:
-                changes_str = ", ".join(f"{p}: {c:+.0f}" for p, c in elo_changes.items())
-                print(f"    Elo changes: {changes_str}")
-
-            # Show responses
-            extras = meta.get("extras", {})
-            responses = extras.get("responses", {})
-            for player, response in responses.items():
-                print(f"    {player}: {truncate(response, 80)}")
+            # Show rewards and advantages per role
+            for role_id, reward in sorted(role_rewards.items()):
+                adv = role_advantages.get(role_id, 0)
+                print(f"    {role_id}: reward={reward:+.1f}, advantage={adv:+.3f}")
 
         elif episode_type == "challenge_propose":
             new_challenge = meta.get("extras", {}).get("challenge", "N/A")
@@ -257,7 +268,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EloArena: Tournament competition with Elo ratings")
     parser.add_argument("--model-path", default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit")
-    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-layers", type=int, default=16)
     parser.add_argument("--url", type=str, default=None)
     parser.add_argument("--host", type=str, default="localhost")

@@ -243,19 +243,20 @@ async def _run_chat_loop(
 
         user_parts = []
 
-        # 1. Player-specific observation (if provided)
         obs = get_observation(state, arena, artifact) if get_observation else None
-        if obs:
-            user_parts.append(obs)
 
-        # 2. Initial context (on first turn, or always if no observation returned)
+        # 1. Initial context (on first turn, or always if no observation returned)
         if state.turn == 0 or not obs:
             if initial_context:
                 user_parts.append(initial_context)
 
-        # 3. Transcript (conversation history)
+        # 2. Transcript (conversation history)
         if transcript:
-            user_parts.append(f"Conversation so far:\n{transcript}")
+            user_parts.append(f"Conversation so far:\n{transcript}\nEnd of history.")
+
+        # 3. Observation (player-specific, fresh each turn, NOT in transcript)
+        if obs:
+            user_parts.append(obs)
 
         user_string = "\n\n".join(user_parts)
         # Build prompt

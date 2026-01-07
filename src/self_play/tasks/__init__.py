@@ -7,6 +7,7 @@ These tasks demonstrate how to implement various self-play scenarios:
 3. Negotiation: SPIRAL-style SimpleNegotiation with RAE credit assignment
 4. RefineLoop: Generator-Critic iterative refinement (cooperative)
 5. EloArena: Tournament competition with persistent Elo ratings
+6. SPICE: Self-Play In Corpus Environment (corpus-grounded Q&A generation)
 
 See examples/train_*.py scripts for complete usage.
 """
@@ -44,6 +45,14 @@ from .elo_arena import (
     elo_match_reward,
 )
 
+from .spice import (
+    SpiceProposerEpisode,
+    SpiceSolverEpisode,
+    SpiceArena,
+    solver_llm_judge_reward,
+    proposer_pass_rate_reward,
+)
+
 __all__ = [
     # Proposer/Solver
     "ProposerEpisode",
@@ -69,4 +78,10 @@ __all__ = [
     "EloMatchEpisode",
     "EloArena",
     "elo_match_reward",
+    # SPICE (corpus-grounded Q&A)
+    "SpiceProposerEpisode",
+    "SpiceSolverEpisode",
+    "SpiceArena",
+    "solver_llm_judge_reward",
+    "proposer_pass_rate_reward",
 ]

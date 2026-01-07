@@ -62,9 +62,9 @@ async def preview_refine_loop(arena, concurrency: int = 4):
         drafts = extras.get("drafts", [])
         feedback = extras.get("feedback", [])
         for j, draft in enumerate(drafts):
-            print(f"    draft{j+1}: {truncate(draft, 100)}")
+            print(f"    draft{j+1}: {truncate(draft, 10000)}")
         for j, fb in enumerate(feedback):
-            print(f"    critique{j+1}: {truncate(fb, 100)}")
+            print(f"    critique{j+1}: {truncate(fb, 10000)}")
         print()
 
     # Summary
@@ -76,8 +76,8 @@ async def preview_refine_loop(arena, concurrency: int = 4):
 # Creative writing tasks for refinement
 TASKS = [
     {
-        "task": "Write a haiku about programming",
-        "requirements": "Must follow 5-7-5 syllable structure. Should capture the essence of coding.",
+        "task": "Write a poem about programming",
+        "requirements": "Should capture the essence of coding.",
     },
     {
         "task": "Write a product description for a smart water bottle",
@@ -124,15 +124,19 @@ But DO NOT then suggest a revised draft.
 
 TASK_PROPOSER_SYSTEM_PROMPT = """You are a creative writing task designer.
 Generate novel, well-structured writing tasks with clear requirements.
-Tasks should be challenging but achievable with iterative refinement."""
+Tasks should be challenging but achievable with iterative refinement.
+Don't ask for something incredibly complex like a limerick or a haiku, or something similar that requires a very specific format."""
 
 
-def load_model_with_lora(model_path: str, lora_rank: int = 8, lora_layers: int = 16):
+def load_model_with_lora(model_path: str, lora_rank: int = 16, lora_layers: int = 16):
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers})...")
-    linear_to_lora_layers(model, lora_layers, {"rank": lora_rank, "scale": 20.0, "dropout": 0.0})
+    # Defaults match official LiquidAI/PEFT recommendations
+    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
+
+    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
+    linear_to_lora_layers(model, lora_layers, {"rank": lora_rank, "scale": 32.0, "dropout": 0.05, "keys": lora_keys})
 
     trainable = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
     total = sum(p.size for _, p in tree_flatten(model.parameters()))
@@ -252,7 +256,7 @@ if __name__ == "__main__":
         # default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit",
         default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen2.5-1.5B-Instruct-MLX-8bit",
     help="Path to the model to train on")
-    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-layers", type=int, default=16)
     parser.add_argument("--url", type=str, default=None)
     parser.add_argument("--host", type=str, default="localhost")
