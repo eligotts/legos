@@ -64,7 +64,7 @@ class TrainerConfig:
     # Skip batch if clip fraction exceeds this threshold
     # Prevents training on batches where policy has diverged too much
     # Returns zero loss (zero gradients) when triggered
-    clip_skip_threshold: float = 0.5
+    clip_skip_threshold: float = 0.3
 
     # Weight publishing: URL of mlx-vllm inference server
     weight_push_url: str = "http://localhost:8000"
@@ -84,3 +84,7 @@ class TrainerConfig:
     # Evaluation settings
     eval_every: int = 10  # Run eval every N steps (0 = disabled)
     eval_concurrency: int = 8  # Concurrency for eval rollouts
+
+    # Checkpointing (saves LoRA weights)
+    checkpoint_every: int = 0  # Save checkpoint every N steps (0 = disabled)
+    checkpoint_dir: Optional[str] = None  # Directory for checkpoints (required if checkpoint_every > 0)

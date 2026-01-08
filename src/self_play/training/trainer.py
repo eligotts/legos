@@ -1,12 +1,11 @@
 """
-Trainer class for RL training with gradient accumulation.
+Trainer class for RL training with streaming gradient accumulation.
 
-The Trainer orchestrates:
-1. Filtering stale records based on policy version
-2. Splitting into micro-batches by token budget
-3. Gradient accumulation across micro-batches
-4. Optimizer step
-5. Weight publishing to inference server
+The Trainer supports two modes:
+1. Streaming: accumulate() processes micro-batches one at a time, steps when batch_size reached
+2. Batch: train_step() processes all records at once (for simple_training_loop)
+
+Both modes share the same underlying gradient accumulation logic.
 """
 from __future__ import annotations
 
@@ -17,7 +16,10 @@ from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+from mlx.utils import tree_map, tree_flatten
+from pathlib import Path
+
+from collections import defaultdict
 
 from ..core.types import TrainingBatch, TrainingRecord
 from .config import TrainerConfig
@@ -26,23 +28,39 @@ from .loss import make_loss_fn
 from .weight_publisher import WeightPublisher
 
 
+def compute_per_role_reward_stats(records: List[TrainingRecord]) -> Dict[str, float]:
+    """Compute per-role reward statistics (avg/min/max)."""
+    if not records:
+        return {}
+
+    role_rewards: Dict[str, List[float]] = defaultdict(list)
+    for r in records:
+        role_rewards[r.role_id].append(r.reward)
+
+    stats: Dict[str, float] = {}
+    for role_id, rewards in role_rewards.items():
+        stats[f"reward_{role_id}_avg"] = sum(rewards) / len(rewards)
+        stats[f"reward_{role_id}_min"] = min(rewards)
+        stats[f"reward_{role_id}_max"] = max(rewards)
+        stats[f"reward_{role_id}_count"] = float(len(rewards))
+
+    return stats
+
+
 class Trainer:
     """
-    RL trainer with gradient accumulation and weight publishing.
+    RL trainer with streaming gradient accumulation and weight publishing.
 
-    This is a clean, minimal implementation that embodies the core patterns
-    of modern RL training:
-    - Staleness filtering by policy version
-    - Token-budget-based micro-batching
-    - Gradient accumulation
-    - Online weight updates to inference server
+    Supports both streaming (accumulate()) and batch (train_step()) modes.
 
-    Example:
-        model, tokenizer = load_model_with_lora(...)
-        optimizer = mx.optimizers.Adam(learning_rate=1e-5)
-        config = TrainerConfig()
-        publisher = WeightPublisher(base_url="http://localhost:8000")
+    Example (streaming):
+        trainer = Trainer(model, optimizer, config, publisher)
+        for micro_batch in micro_batches:
+            result = await trainer.accumulate(micro_batch)
+            if result['stepped']:
+                # Handle step completion
 
+    Example (batch):
         trainer = Trainer(model, optimizer, config, publisher)
         metrics = await trainer.train_step(batch)
     """
@@ -89,6 +107,24 @@ class Trainer:
         else:
             self._effective_loss_type = config.loss_type
 
+        # Streaming gradient accumulation state
+        self._reset_pending()
+
+    def _reset_pending(self) -> None:
+        """Reset streaming accumulation state after optimizer step."""
+        self._weighted_grad_sum = None  # Weighted sum of gradients
+        self._pending_samples = 0  # Samples accumulated (excluding skipped)
+        self._pending_tokens = 0  # For token-weighted mode and metrics
+        self._pending_records: List[TrainingRecord] = []  # For reward stats
+        self._pending_metrics: List[Tuple[Dict, int]] = []  # (metrics_dict, n_samples)
+        self._pending_skipped = 0  # Count of skipped micro-batches
+        self._step_start_time: Optional[float] = None
+
+    @property
+    def pending_samples(self) -> int:
+        """Number of samples accumulated but not yet stepped."""
+        return self._pending_samples
+
     def filter_stale_records(
         self,
         records: List[TrainingRecord],
@@ -110,23 +146,25 @@ class Trainer:
                 fresh.append(r)
         return fresh
 
-    def _train_step_sync(
+    def _accumulate_micro_batch_sync(
         self,
-        fresh_records: List[TrainingRecord],
-    ) -> Tuple[Dict[str, float], int]:
+        records: List[TrainingRecord],
+    ) -> Tuple[int, int, bool]:
         """
-        Synchronous training step - runs in a separate thread.
-
-        This contains all the CPU/GPU-bound MLX work that would otherwise
-        block the asyncio event loop.
+        Process one micro-batch synchronously, accumulating gradients.
 
         Args:
-            fresh_records: Pre-filtered list of fresh training records
+            records: Training records for this micro-batch
 
         Returns:
-            Tuple of (metrics dict, new train_step_idx)
+            Tuple of (samples_added, tokens_added, was_skipped)
         """
-        step_start = time.perf_counter()
+        if not records:
+            return 0, 0, False
+
+        # Start timing on first micro-batch of this step
+        if self._step_start_time is None:
+            self._step_start_time = time.perf_counter()
 
         # Set memory limit - helps with memory pressure
         try:
@@ -134,83 +172,90 @@ class Trainer:
         except Exception:
             pass  # May not be available on all systems
 
-        # Split into micro-batches by token budget
-        micro_batches = split_by_token_budget(
-            fresh_records,
-            self.config.micro_token_budget,
+        # Collate into tensors
+        input_ids, loss_mask, inference_logprobs, advantages = collate(
+            records,
+            pad_token_id=self.config.pad_token_id,
         )
-
-        # Gradient accumulation loop
-        accumulated_grads = None
-        total_tokens = 0
-        total_records = len(fresh_records)
-        skipped_micro_batches = 0
-
-        # For token-level weighting, compute total tokens upfront
-        if self._effective_loss_type == "token":
-            total_tokens_for_weight = sum(len(r.completion_token_ids) for r in fresh_records)
-
-        # Track lazy losses/metrics for batched eval at the end
-        micro_losses = []  # List of (loss, num_records)
-        micro_metrics = []  # List of (metrics_dict, num_records)
 
         # Create value_and_grad function
         loss_and_grad_fn = nn.value_and_grad(self.model, self._loss_fn)
 
-        for micro in micro_batches:
-            # Collate into tensors
-            input_ids, loss_mask, inference_logprobs, advantages = collate(
-                micro,
-                pad_token_id=self.config.pad_token_id,
-            )
+        # Compute loss, metrics, and gradients in a SINGLE forward pass
+        (loss, metrics), grads = loss_and_grad_fn(
+            self.model,
+            input_ids,
+            inference_logprobs,
+            advantages,
+            loss_mask,
+        )
 
-            # Compute loss, metrics, and gradients in a SINGLE forward pass
-            (loss, metrics), grads = loss_and_grad_fn(
-                self.model,
-                input_ids,
-                inference_logprobs,
-                advantages,
-                loss_mask,
-            )
+        n_samples = len(records)
+        n_tokens = sum(len(r.completion_token_ids) for r in records)
 
-            # For memory-constrained systems: eval immediately to free activations
-            if self.config.eval_per_micro_batch:
-                mx.eval(loss, metrics["clip_fraction"], metrics["kl"], grads)
+        # For memory-constrained systems: eval immediately to free activations
+        if self.config.eval_per_micro_batch:
+            mx.eval(loss, metrics["clip_fraction"], metrics["kl"], grads)
 
-            # Track skipped micro-batches (due to high clip fraction)
-            if metrics.get("skip_batch", mx.array(False)).item():
-                skipped_micro_batches += 1
+        # Check if this micro-batch was skipped (high clip fraction)
+        was_skipped = metrics.get("skip_batch", mx.array(False)).item()
 
-            # Track metrics (compute before weighting for token-level mode)
-            micro_tokens = sum(len(r.completion_token_ids) for r in micro)
-
-            # Accumulate gradients with appropriate weighting
-            if self._effective_loss_type == "token":
-                # DAPO: weight by token count
-                weight = micro_tokens / total_tokens_for_weight
-            else:
-                # GRPO/GSPO: weight by sample count
-                weight = len(micro) / total_records
-
-            if accumulated_grads is None:
-                accumulated_grads = tree_map(lambda g: g * weight, grads)
-            else:
-                accumulated_grads = tree_map(
-                    lambda a, g: a + g * weight,
-                    accumulated_grads,
-                    grads,
-                )
-            micro_losses.append((loss, len(micro)))
-            micro_metrics.append((metrics, len(micro)))
-            total_tokens += micro_tokens
-
-            # Clear cache after each micro-batch to free memory
+        if was_skipped:
+            self._pending_skipped += 1
             if self.config.eval_per_micro_batch:
                 mx.clear_cache()
+            return 0, 0, True
+
+        # Accumulate gradients weighted by sample or token count
+        # We'll normalize at step time by dividing by total
+        if self._effective_loss_type == "token":
+            weight = n_tokens
+        else:
+            weight = n_samples
+
+        if self._weighted_grad_sum is None:
+            self._weighted_grad_sum = tree_map(lambda g: g * weight, grads)
+        else:
+            self._weighted_grad_sum = tree_map(
+                lambda s, g: s + g * weight,
+                self._weighted_grad_sum,
+                grads,
+            )
+
+        # Track state for this micro-batch
+        self._pending_samples += n_samples
+        self._pending_tokens += n_tokens
+        self._pending_records.extend(records)
+        self._pending_metrics.append((metrics, n_samples))
+
+        if self.config.eval_per_micro_batch:
+            mx.clear_cache()
+
+        return n_samples, n_tokens, False
+
+    def _optimizer_step_sync(self) -> Dict[str, float]:
+        """
+        Apply accumulated gradients and return metrics.
+
+        Returns:
+            Dictionary of training metrics
+        """
+        if self._pending_samples == 0 or self._weighted_grad_sum is None:
+            return {"skipped": 1, "records": 0}
+
+        # Normalize gradients by total weight
+        if self._effective_loss_type == "token":
+            normalizer = self._pending_tokens
+        else:
+            normalizer = self._pending_samples
+
+        final_grads = tree_map(
+            lambda g: g / normalizer,
+            self._weighted_grad_sum,
+        )
 
         # Optimizer step
-        self.optimizer.update(self.model, accumulated_grads)
-        accumulated_grads = None  # Release reference before eval
+        self.optimizer.update(self.model, final_grads)
 
         # Materialize model parameters AND optimizer state (momentum buffers)
         # This breaks the lazy computation graph that would otherwise hold
@@ -219,65 +264,173 @@ class Trainer:
         mx.eval(self.optimizer.state)
         mx.clear_cache()
 
-        # Evaluate losses/metrics if not done per-micro-batch
+        # Evaluate metrics if not done per-micro-batch
         if not self.config.eval_per_micro_batch:
-            all_losses = [loss for loss, _ in micro_losses]
-            all_clip_fracs = [m["clip_fraction"] for m, _ in micro_metrics]
-            all_kls = [m["kl"] for m, _ in micro_metrics]
+            all_clip_fracs = [m["clip_fraction"] for m, _ in self._pending_metrics]
+            all_kls = [m["kl"] for m, _ in self._pending_metrics]
+            all_losses = [m.get("loss", mx.array(0.0)) for m, _ in self._pending_metrics]
             mx.eval(*all_losses, *all_clip_fracs, *all_kls)
 
-        # Extract scalar values
-        total_loss = sum(float(loss.item()) * n for loss, n in micro_losses)
-        total_clip_fraction = sum(float(m["clip_fraction"].item()) * n for m, n in micro_metrics)
-        total_kl = sum(float(m["kl"].item()) * n for m, n in micro_metrics)
-
-        # Aggregate K1 metrics if present (only when use_kl_penalty=True)
+        # Aggregate metrics across micro-batches
+        total_loss = 0.0
+        total_clip_fraction = 0.0
+        total_kl = 0.0
         total_k1_seq = 0.0
         total_k1_clipped_frac = 0.0
-        has_k1_metrics = any("k1_seq_mean" in m for m, _ in micro_metrics)
-        if has_k1_metrics:
-            for m, n in micro_metrics:
-                if "k1_seq_mean" in m:
-                    total_k1_seq += float(m["k1_seq_mean"].item()) * n
-                    total_k1_clipped_frac += float(m["k1_clipped_frac"].item()) * n
+        has_k1_metrics = any("k1_seq_mean" in m for m, _ in self._pending_metrics)
 
-        mx.clear_cache()
+        for m, n in self._pending_metrics:
+            total_loss += float(m.get("loss", mx.array(0.0)).item()) * n
+            total_clip_fraction += float(m["clip_fraction"].item()) * n
+            total_kl += float(m["kl"].item()) * n
+            if has_k1_metrics and "k1_seq_mean" in m:
+                total_k1_seq += float(m["k1_seq_mean"].item()) * n
+                total_k1_clipped_frac += float(m["k1_clipped_frac"].item()) * n
 
         # Increment step counter
         self.train_step_idx += 1
 
-        step_total = time.perf_counter() - step_start
+        step_total = time.perf_counter() - (self._step_start_time or time.perf_counter())
 
         # Compute averages
-        num_fresh = len(fresh_records)
-        avg_loss = total_loss / num_fresh
-        avg_kl = total_kl / num_fresh
-        avg_clip = total_clip_fraction / num_fresh
+        num_samples = self._pending_samples
+        avg_loss = total_loss / num_samples
+        avg_kl = total_kl / num_samples
+        avg_clip = total_clip_fraction / num_samples
+
+        # Compute reward stats from accumulated records
+        reward_stats = compute_per_role_reward_stats(self._pending_records)
+        if num_samples > 0:
+            reward_stats["avg_reward"] = sum(r.reward for r in self._pending_records) / num_samples
+            reward_stats["avg_advantage"] = sum(r.advantage for r in self._pending_records) / num_samples
+        else:
+            reward_stats["avg_reward"] = 0.0
+            reward_stats["avg_advantage"] = 0.0
 
         result = {
             "loss": avg_loss,
-            "tokens": total_tokens,
-            "records": num_fresh,
+            "tokens": self._pending_tokens,
+            "records": num_samples,
             "clip_fraction": avg_clip,
             "kl": avg_kl,
             "train_step": self.train_step_idx,
             "step_time_s": step_total,
-            "skipped_micro_batches": skipped_micro_batches,
+            "skipped_micro_batches": self._pending_skipped,
         }
+
+        # Add reward stats with train/ prefix
+        result.update({f"train/{k}": v for k, v in reward_stats.items()})
 
         # Add K1 metrics if present
         if has_k1_metrics:
-            result["k1_seq_mean"] = total_k1_seq / num_fresh
-            result["k1_clipped_frac"] = total_k1_clipped_frac / num_fresh
+            result["k1_seq_mean"] = total_k1_seq / num_samples
+            result["k1_clipped_frac"] = total_k1_clipped_frac / num_samples
 
-        return result, self.train_step_idx
+        mx.clear_cache()
+
+        # Reset state for next step
+        self._reset_pending()
+
+        return result
+
+    def save_checkpoint(self, step: Optional[int] = None) -> Optional[str]:
+        """
+        Save LoRA weights to checkpoint directory.
+
+        Args:
+            step: Step number for checkpoint name. If None, uses train_step_idx.
+
+        Returns:
+            Path to saved checkpoint, or None if checkpointing disabled.
+        """
+        if not self.config.checkpoint_dir:
+            return None
+
+        step = step if step is not None else self.train_step_idx
+        checkpoint_dir = Path(self.config.checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_path = checkpoint_dir / f"step_{step}.safetensors"
+
+        # Save only trainable parameters (LoRA weights)
+        weights = dict(tree_flatten(self.model.trainable_parameters()))
+        mx.save_safetensors(str(checkpoint_path), weights)
+
+        return str(checkpoint_path)
+
+    async def accumulate(self, records: List[TrainingRecord]) -> Dict:
+        """
+        Process records as micro-batch, accumulating gradients.
+        Triggers optimizer step when pending_samples >= batch_size.
+
+        Args:
+            records: Training records for one micro-batch
+
+        Returns:
+            Dict with keys:
+                samples_added: Samples that contributed gradients
+                samples_skipped: Samples in skipped micro-batches
+                stale_filtered: Stale records filtered out
+                stepped: Whether optimizer step occurred
+                step_metrics: Metrics dict if stepped, else None
+        """
+        self.model.train()
+
+        # Filter stale records
+        fresh = self.filter_stale_records(records)
+        stale_count = len(records) - len(fresh)
+
+        result = {
+            "samples_added": 0,
+            "samples_skipped": 0,
+            "stale_filtered": stale_count,
+            "stepped": False,
+            "step_metrics": None,
+        }
+
+        if not fresh:
+            return result
+
+        # Process micro-batch in thread (CPU/GPU-bound work)
+        samples_added, tokens_added, was_skipped = await asyncio.to_thread(
+            self._accumulate_micro_batch_sync, fresh
+        )
+
+        result["samples_added"] = samples_added
+        if was_skipped:
+            result["samples_skipped"] = len(fresh)
+
+        # Check if we should step
+        if self._pending_samples >= self.config.batch_size:
+            step_metrics = await asyncio.to_thread(self._optimizer_step_sync)
+
+            # Check for divergence (NaN loss = corrupted gradients = dead model)
+            if math.isnan(step_metrics.get("loss", 0.0)):
+                raise RuntimeError(
+                    f"Training diverged (NaN loss) at step {self.train_step_idx}. "
+                    f"Reduce learning rate and restart from last checkpoint."
+                )
+
+            # Push weights to inference server
+            if self.publisher is not None:
+                try:
+                    await self.publisher.publish(self.model, version=self.train_step_idx)
+                except Exception:
+                    pass  # Weight publishing failures are non-fatal
+
+            result["stepped"] = True
+            result["step_metrics"] = step_metrics
+
+        return result
 
     async def train_step(self, batch: TrainingBatch) -> Dict[str, float]:
         """
         Execute one training step with gradient accumulation.
 
-        The CPU/GPU-bound MLX work runs in a separate thread via asyncio.to_thread()
-        to avoid blocking the event loop, allowing generation to proceed in parallel.
+        Processes all records in batch, splits into micro-batches, accumulates
+        gradients, and performs one optimizer step.
+
+        Used by simple_training_loop which needs synchronous batch processing.
 
         Args:
             batch: TrainingBatch containing records to train on
@@ -298,24 +451,39 @@ class Trainer:
                 "records": 0,
             }
 
-        # Run CPU/GPU-bound training in a separate thread
-        metrics, new_step_idx = await asyncio.to_thread(
-            self._train_step_sync,
+        # Split into micro-batches
+        micro_batches = split_by_token_budget(
             fresh_records,
+            self.config.micro_token_budget,
         )
-        metrics["stale_dropped"] = stale_count
 
-        # Check for divergence (NaN in loss or KL)
-        if math.isnan(metrics.get("loss", 0.0)) or math.isnan(metrics.get("kl", 0.0)):
-            print(f"\n[trainer] WARNING: NaN detected at step {new_step_idx}!")
-            print(f"  metrics: {metrics}")
-            print("  This usually means the learning rate is too high or the model has diverged.")
+        # Process each micro-batch (accumulating gradients)
+        for micro in micro_batches:
+            await asyncio.to_thread(self._accumulate_micro_batch_sync, micro)
 
-        # Push weights to inference server
-        if self.publisher is not None:
-            try:
-                await self.publisher.publish(self.model, version=new_step_idx)
-            except Exception:
-                pass  # Weight publishing failures are non-fatal
+        # Force optimizer step (we want exactly one step per train_step call)
+        if self._pending_samples > 0:
+            metrics = await asyncio.to_thread(self._optimizer_step_sync)
 
-        return metrics
+            # Check for divergence (NaN loss = corrupted gradients = dead model)
+            if math.isnan(metrics.get("loss", 0.0)):
+                raise RuntimeError(
+                    f"Training diverged (NaN loss) at step {self.train_step_idx}. "
+                    f"Reduce learning rate and restart from last checkpoint."
+                )
+
+            # Push weights to inference server
+            if self.publisher is not None:
+                try:
+                    await self.publisher.publish(self.model, version=self.train_step_idx)
+                except Exception:
+                    pass  # Weight publishing failures are non-fatal
+
+            metrics["stale_dropped"] = stale_count
+            return metrics
+
+        return {
+            "skipped": 1,
+            "stale_dropped": stale_count,
+            "records": 0,
+        }

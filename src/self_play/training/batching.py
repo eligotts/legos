@@ -8,6 +8,57 @@ import mlx.core as mx
 from ..core.types import TrainingRecord
 
 
+def estimate_tokens(records: List[TrainingRecord]) -> int:
+    """Total tokens (input_ids) across all records."""
+    return sum(len(r.input_ids) for r in records)
+
+
+def form_micro_batch(
+    records: List[TrainingRecord],
+    budget: int,
+) -> Tuple[List[TrainingRecord], List[TrainingRecord]]:
+    """
+    Pop one micro-batch from front of records list.
+
+    Greedily adds records until budget would be exceeded.
+    Single records larger than budget still get their own micro-batch.
+
+    Args:
+        records: List of training records to form micro-batch from
+        budget: Maximum total tokens per micro-batch
+
+    Returns:
+        Tuple of (micro_batch, remaining_records)
+    """
+    if not records:
+        return [], []
+
+    micro_batch: List[TrainingRecord] = []
+    current_tokens = 0
+
+    for i, record in enumerate(records):
+        record_tokens = len(record.input_ids)
+
+        # If this record alone exceeds budget, give it its own micro-batch
+        if record_tokens > budget:
+            if micro_batch:
+                # Return what we have, this record will be next
+                return micro_batch, records[i:]
+            else:
+                # This single record is the micro-batch
+                return [record], records[i + 1 :]
+
+        # If adding this record would exceed budget, finalize current micro-batch
+        if current_tokens + record_tokens > budget and micro_batch:
+            return micro_batch, records[i:]
+
+        micro_batch.append(record)
+        current_tokens += record_tokens
+
+    # All records consumed
+    return micro_batch, []
+
+
 def split_by_token_budget(
     records: List[TrainingRecord],
     budget: int,

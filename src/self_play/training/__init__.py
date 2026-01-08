@@ -37,7 +37,7 @@ from .config import TrainerConfig
 from .trainer import Trainer
 from .weight_publisher import WeightPublisher
 from .loop import training_loop, simple_training_loop
-from .batching import split_by_token_budget, collate
+from .batching import split_by_token_budget, collate, estimate_tokens, form_micro_batch
 from .loss import compute_loss, get_per_token_logps, make_loss_fn
 
 __all__ = [
@@ -51,6 +51,8 @@ __all__ = [
     # Utilities
     "split_by_token_budget",
     "collate",
+    "estimate_tokens",
+    "form_micro_batch",
     # Loss functions
     "compute_loss",
     "get_per_token_logps",

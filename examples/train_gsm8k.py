@@ -287,10 +287,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--train-batch-size", type=int, default=32)
     parser.add_argument("--micro-token-budget", type=int, default=2048)
-    parser.add_argument("--max-policy-lag", type=int, default=3)
-    parser.add_argument("--kl-coef", type=float, default=0.2)
+    parser.add_argument("--max-policy-lag", type=int, default=2)
+    parser.add_argument("--kl-coef", type=float, default=0.1)
     parser.add_argument("--use-kl-penalty", action="store_true")
-    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--step-concurrency", type=int, default=4)
 
     # Generation

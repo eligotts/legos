@@ -290,23 +290,38 @@ class TaskProposerEpisode(Episode):
         )
         state.trajectory.append(step)
 
-        # Parse and store new task
+        # Parse proposed task
         new_task = self._parse_task(response.text)
         state.data["proposed_task"] = new_task
         state.data["raw_response"] = response.text  # Store raw for debugging
 
-        if new_task and new_task.get("task") and new_task.get("requirements"):
+        state.done = True
+        return state
+
+    async def generate(
+        self,
+        arena: Arena,
+        artifact: Any,
+        meta: Optional[Dict[str, Any]] = None,
+        is_trainable: bool = True,
+    ) -> "GenerateResult":
+        from ..core import GenerateResult
+
+        result = await super().generate(arena, artifact, meta=meta, is_trainable=is_trainable)
+
+        # Store generated task in tasks store
+        proposed = result.rollout.extras.get("proposed_task")
+        if proposed and proposed.get("task") and proposed.get("requirements"):
             if "tasks" in arena.stores:
                 task_id = f"gen_{arena.stores['tasks'].count()}"
                 arena.stores["tasks"].add(Artifact(
                     id=task_id,
-                    data=new_task,
+                    data=proposed,
                 ))
                 if arena.verbose:
-                    print(f"    [task_proposer] added: {new_task['task']}...{new_task['requirements']}")
+                    print(f"    [task_proposer] added: {proposed['task']}...{proposed['requirements']}")
 
-        state.done = True
-        return state
+        return result
 
     def _build_prompt(self, arena: Arena, examples: List[Dict]) -> Messages:
         role = arena.roles.get(self.proposer_role)

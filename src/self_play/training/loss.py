@@ -196,7 +196,10 @@ def compute_loss(
         adjusted_advantages = advantages
 
     # Compute log importance ratio (per-token)
+    # Clip before exp() to prevent overflow: exp(700) = inf, exp(10) ≈ 22000
+    # Ratios beyond ±10 indicate severe policy divergence - clamping loses no useful signal
     log_ratio = trainer_logprobs - inference_logprobs
+    log_ratio = mx.clip(log_ratio, -10.0, 10.0)
 
     # Determine effective clip bounds
     if importance_sampling == "sequence":

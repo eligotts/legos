@@ -78,7 +78,11 @@ async def chat_completions(
         token_logprobs = []
         for token_id, logprob in zip(result.tokens, result.logprobs):
             # Safe JSON serialization: replace NaN with a very low logprob
-            safe_logprob = logprob if not math.isnan(logprob) else -100.0
+            if math.isnan(logprob):
+                print(f"[inference] WARNING: NaN logprob for token {token_id}, using -100.0")
+                safe_logprob = -100.0
+            else:
+                safe_logprob = logprob
             token_str = engine.tokenizer.decode([token_id])
             token_logprobs.append(
                 TokenLogprob(
