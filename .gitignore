@@ -168,3 +168,5 @@ wandb/
 
 .claude/
 CLAUDE.md
+
+mlx_model/
