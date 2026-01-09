@@ -22,6 +22,9 @@ class ServerConfig(BaseSettings):
     lora_rank: int | None = None  # If set, enables LoRA with this rank
     lora_layers: int = -1  # Number of layers to apply LoRA to (-1 for all)
     lora_scale: float = 64.0  # LoRA scaling factor (lora_alpha)
-    lora_keys: list[str] | None = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    lora_keys: list[str] | None = [
+      "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+      "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"
+  ]
 
     model_config = {"env_prefix": "SELF_PLAY_"}

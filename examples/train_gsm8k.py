@@ -49,7 +49,7 @@ def load_model_with_lora(
     model, tokenizer = load(model_path)
 
     # Defaults match official LiquidAI/PEFT recommendations
-    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
+    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}
 
     print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
     lora_config = {
@@ -268,7 +268,8 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str,
         # default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit")
         # default="/Users/eligottlieb/.lmstudio/models/mlx-community/Qwen3-0.6B-8bit")
-        default="/Users/eligottlieb/.lmstudio/models/LiquidAI/LFM2.5-1.2B-Instruct-MLX-8bit")
+        # default="/Users/eligottlieb/.lmstudio/models/LiquidAI/LFM2.5-1.2B-Instruct-MLX-8bit")
+        default="mlx_model")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-layers", type=int, default=16)
 
