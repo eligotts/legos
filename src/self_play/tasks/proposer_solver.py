@@ -146,6 +146,21 @@ class SolveEpisode(SingleTurnEpisode):
 Think step by step, then provide your final answer.
 You MUST end your response with: "The answer is: " followed by the answer."""
 
+    def get_extras(self, state: EpisodeState) -> Dict[str, Any]:
+        """Include response and extracted answer for preview/debugging."""
+        response = state.last_completion_text or ""
+
+        # Extract answer using same logic as rubric
+        if "The answer is:" in response:
+            extracted = response.split("The answer is:")[-1].strip().rstrip(".")
+        else:
+            extracted = response.strip().split("\n")[-1] if response else ""
+
+        return {
+            "response": response,
+            "extracted_answer": extracted,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Proposer Episode

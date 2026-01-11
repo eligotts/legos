@@ -165,8 +165,9 @@ async def preview_proposer_solver(arena, concurrency: int = 4):
             ground_truth = artifact.get("ground_truth", "N/A")
             response = extras.get("response", "N/A")
             extracted = extras.get("extracted_answer", "N/A")
-            is_correct = meta.get("correct", False)
             reward = data["records"][0].reward if data["records"] else 0
+            # Derive correctness from reward (exact match rubric gives 1.0 for correct)
+            is_correct = reward > 0.5
 
             solve_stats["total"] += 1
             if is_correct:

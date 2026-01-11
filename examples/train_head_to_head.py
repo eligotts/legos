@@ -87,9 +87,14 @@ CHALLENGES = [
 ]
 
 
-COMPETITOR_SYSTEM_PROMPT = """You are a creative competitor in a writing challenge.
-Give your best, most creative response to each challenge.
-Be original, engaging, and thoughtful.
+COMPETITOR0_SYSTEM_PROMPT = """You are a competitor in a writing challenge.
+Give your best response to each challenge.
+You are logical and analytical at heart, so your output should always prioritize logical and analytical writing.
+Quality matters more than length."""
+
+COMPETITOR1_SYSTEM_PROMPT = """You are a competitor in a writing challenge.
+Give your best response to each challenge.
+You are a creative at heart, so your output should always prioritize creative writing.
 Quality matters more than length."""
 
 CHALLENGE_PROPOSER_SYSTEM_PROMPT = """You are a creative challenge designer.
@@ -187,13 +192,13 @@ async def main(args):
     # Both players use same system prompt (same model, different "virtual" players)
     arena.add_actor(Actor(
         id="Player0",
-        system_prompt=COMPETITOR_SYSTEM_PROMPT,
+        system_prompt=COMPETITOR0_SYSTEM_PROMPT,
         max_tokens=MAX_TOKENS,
     ))
 
     arena.add_actor(Actor(
         id="Player1",
-        system_prompt=COMPETITOR_SYSTEM_PROMPT,
+        system_prompt=COMPETITOR1_SYSTEM_PROMPT,
         max_tokens=MAX_TOKENS,
     ))
 

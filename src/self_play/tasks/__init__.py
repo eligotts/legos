@@ -24,7 +24,6 @@ from .gsm8k import (
     load_gsm8k,
     extract_xml_answer,
     extract_hash_answer,
-    SYSTEM_PROMPT as GSM8K_SYSTEM_PROMPT,
 )
 
 from .negotiation import (

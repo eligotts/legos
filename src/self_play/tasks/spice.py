@@ -39,6 +39,7 @@ def _get_openrouter_client() -> AsyncOpenAI:
         _openrouter_client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
+            timeout=30.0,  # 30 second timeout to prevent hanging
         )
     return _openrouter_client
 
@@ -49,6 +50,7 @@ from ..core import (
     Episode,
     EpisodeState,
     SingleTurnEpisode,
+    GenerateResult,
     Rubric,
     Arena,
     InferenceClient,
@@ -318,9 +320,7 @@ class SpiceProposerEpisode(Episode):
         artifact: Any,
         meta: Optional[Dict[str, Any]] = None,
         is_trainable: bool = True,
-    ) -> "GenerateResult":
-        from ..core import GenerateResult
-
+    ) -> GenerateResult:
         result = await super().generate(arena, artifact, meta=meta, is_trainable=is_trainable)
 
         # Store generated question in questions store
