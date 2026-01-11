@@ -5,6 +5,7 @@ This example demonstrates:
 - ProposerEpisode spawns multiple SolverEpisodes
 - Each SolverEpisode produces its own training records
 - Proposer's reward derives from solver performance
+- Solver completions that are used to get a proposer reward are NOT trained on
 
 Structure:
 1. ProposerEpisode.rollout():
@@ -115,8 +116,8 @@ def proposer_pass_rate_reward(
 class SolveEpisode(SingleTurnEpisode):
     """Single-turn episode where the Solver answers a question."""
 
-    def __init__(self, solver_role_id: str = "Solver"):
-        self.solver_role_id = solver_role_id
+    def __init__(self, solver_actor_id: str = "Solver"):
+        self.solver_actor_id = solver_actor_id
         self._rubric = Rubric(funcs=[solver_exact_match])
 
     @property
@@ -128,7 +129,7 @@ class SolveEpisode(SingleTurnEpisode):
         return self._rubric
 
     def get_initial_actor(self, artifact: Any, state: EpisodeState) -> str:
-        return self.solver_role_id
+        return self.solver_actor_id
 
     def get_initial_prompt(
         self,
@@ -162,11 +163,11 @@ class ProposerEpisode(Episode):
 
     def __init__(
         self,
-        proposer_role_id: str = "Proposer",
+        proposer_actor_id: str = "Proposer",
         n_solver_rollouts: int = 4,
         target_pass_rate: float = 0.5,
     ):
-        self.proposer_role_id = proposer_role_id
+        self.proposer_actor_id = proposer_actor_id
         self.n_solver_rollouts = n_solver_rollouts
         self.target_pass_rate = target_pass_rate
         self._rubric = Rubric(funcs=[proposer_pass_rate_reward])
@@ -190,10 +191,10 @@ class ProposerEpisode(Episode):
 
         # Generate question
         prompt = self._build_prompt(arena, artifact)
-        response = await self.call_model(self.proposer_role_id, prompt, arena)
+        response = await self.call_model(self.proposer_actor_id, prompt, arena)
 
         step = Step(
-            role_id=self.proposer_role_id,
+            actor_id=self.proposer_actor_id,
             prompt=prompt,
             completion=response.completion,
             prompt_token_ids=response.prompt_token_ids,
@@ -243,7 +244,7 @@ class ProposerEpisode(Episode):
         return result
 
     def _build_prompt(self, arena: Arena, artifact: Any) -> Messages:
-        role = arena.roles[self.proposer_role_id]
+        actor = arena.actors[self.proposer_actor_id]
 
         few_shot_text = ""
         examples = artifact.get("examples", [])
@@ -268,8 +269,8 @@ class ProposerEpisode(Episode):
         - Respond with ONLY JSON:"""
 
         messages: Messages = []
-        if role.system_prompt:
-            messages.append({"role": "system", "content": role.system_prompt})
+        if actor.system_prompt:
+            messages.append({"role": "system", "content": actor.system_prompt})
         messages.append({"role": "user", "content": user_content})
 
         return messages
@@ -310,15 +311,60 @@ class ProposerEpisode(Episode):
 class ProposerSolverArena(Arena):
     """Arena that schedules proposer episodes (solvers are nested inside)."""
 
-    def __init__(self, client: InferenceClient, batch_size: int = 4, verbose: bool = False):
+    def __init__(
+        self,
+        client: InferenceClient,
+        episodes_per_step: int = 4,
+        min_questions: int = 10,
+        verbose: bool = False,
+    ):
         super().__init__(client, credit_assigner=GRPOCredit(), verbose=verbose)
-        self.batch_size = batch_size
+        self.episodes_per_step = episodes_per_step
+        self.min_questions = min_questions
+
+    async def on_train_start(self) -> None:
+        """Ensure we have at least min_questions in the store before training."""
+        if "questions" not in self.stores:
+            return
+
+        store = self.stores["questions"]
+        current_count = store.count()
+
+        if current_count >= self.min_questions:
+            if self.verbose:
+                print(f"[on_train_start] Already have {current_count} questions, skipping warmup")
+            return
+
+        needed = self.min_questions - current_count
+        if self.verbose:
+            print(f"[on_train_start] Need {needed} more questions (have {current_count}, want {self.min_questions})")
+
+        # Generate questions by running proposer episodes (non-trainable)
+        while store.count() < self.min_questions:
+            # Sample examples for the proposer
+            samples = store.sample(k=min(3, store.count()))
+            examples = [s.data for s in samples]
+
+            # Run a single proposer episode (non-trainable since we're just warming up)
+            request = EpisodeRequest(
+                episode_type="propose",
+                artifact={"examples": examples},
+                is_trainable=False,
+            )
+            await self.generate_rollouts([request])
+
+            # The ProposerEpisode.generate() already adds valid questions to the store
+            if self.verbose:
+                print(f"[on_train_start] Questions in store: {store.count()}")
+
+        if self.verbose:
+            print(f"[on_train_start] Warmup complete, {store.count()} questions ready")
 
     def get_batch(self) -> List[EpisodeRequest]:
         propose_requests: List[EpisodeRequest] = []
         solve_requests: List[EpisodeRequest] = []
         if "questions" in self.stores:
-            for _ in range(self.batch_size):
+            for _ in range(self.episodes_per_step):
                 question = self.stores["questions"].sample_one()
                 if question is None:
                     break

@@ -26,19 +26,6 @@ from ..core import (
 
 
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """Solve the problem step by step. Show your reasoning, then provide your final numerical answer wrapped in <answer></answer> tags.
-
-Example format:
-First, I'll calculate...
-Then...
-Therefore...
-<answer>42</answer>"""
-
-
-# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -152,6 +139,7 @@ def gsm8k_reward(
     if arena.verbose:
         print("-" * 20)
         print(f"Chars: {char_count} | Rewards: format={format_reward:.2f} correct={correctness_reward:.1f} brevity={brevity_reward:.3f} total={total_reward:.3f}")
+        print(f"End of completion: {completion[-100:]}")
 
     return {actor: total_reward}
 
@@ -170,12 +158,12 @@ class GSM8KEpisode(SingleTurnEpisode):
 
     def __init__(
         self,
-        role_id: str = "model",
+        actor_id: str = "model",
         reward_fn: RewardFn | None = None,
         prompt_template: str = "{question}",
         episode_type: str = "gsm8k",
     ):
-        self.role_id = role_id
+        self.actor_id = actor_id
         self.prompt_template = prompt_template
         self._episode_type = episode_type
         self._reward_fn = reward_fn or gsm8k_reward
@@ -190,7 +178,7 @@ class GSM8KEpisode(SingleTurnEpisode):
         return self._rubric
 
     def get_initial_actor(self, artifact: Any, state: EpisodeState) -> str:
-        return self.role_id
+        return self.actor_id
 
     def get_initial_prompt(
         self,
@@ -211,32 +199,30 @@ class GSM8KArena(Arena):
     """
     Arena for GSM8K training with GRPO-style sampling.
 
-    Samples ONE question, repeats it batch_size times.
+    Samples ONE question, repeats it episodes_per_step times.
     This produces multiple rollouts per question for group-relative advantage.
     """
 
     def __init__(
         self,
         client: InferenceClient,
-        batch_size: int = 8,
+        episodes_per_step: int = 8,
         store_name: str = "gsm8k",
         episode_type: str = "gsm8k",
-        weighted_sampling: bool = False,
         credit_assigner: CreditAssigner | None = None,
         verbose: bool = False,
     ):
         super().__init__(client, credit_assigner=credit_assigner or GRPOCredit(), verbose=verbose)
-        self.batch_size = batch_size
+        self.episodes_per_step = episodes_per_step
         self.store_name = store_name
         self._episode_type = episode_type
-        self.weighted_sampling = weighted_sampling
 
     def get_batch(self) -> List[EpisodeRequest]:
-        """Sample ONE question, repeat batch_size times for GRPO."""
+        """Sample ONE question, repeat episodes_per_step times for GRPO."""
         if self.store_name not in self.stores:
             return []
 
-        sample = self.stores[self.store_name].sample_one(weighted=self.weighted_sampling)
+        sample = self.stores[self.store_name].sample_one()
         if sample is None:
             return []
 
@@ -246,5 +232,5 @@ class GSM8KArena(Arena):
                 artifact=sample.data,
                 meta={"artifact_id": sample.id},
             )
-            for _ in range(self.batch_size)
+            for _ in range(self.episodes_per_step)
         ]

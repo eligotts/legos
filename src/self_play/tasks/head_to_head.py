@@ -1,18 +1,15 @@
 """
-EloArena: Tournament competition with persistent Elo ratings.
+HeadToHead: Tournament competition with LLM-judged matches.
 
-Pattern: Head-to-head matches where both players respond to same challenge → LLM judge picks winner → Elo updates.
+Pattern: Head-to-head matches where both players respond to same challenge → LLM judge picks winner → zero-sum rewards.
 
 This demonstrates:
-- Persistent arena state (Elo ratings across batches)
 - Same model playing both sides (self-play)
-- RAECredit for role-conditioned advantages
 - Dynamic challenge generation via ChallengeProposerEpisode
 """
 from __future__ import annotations
 
 import json
-import math
 from typing import Any, Dict, List, Optional
 
 from ..core import (
@@ -25,20 +22,21 @@ from ..core import (
     InferenceClient,
     EpisodeRequest,
     Artifact,
-    RAECredit,
+    GRPOCredit,
     CreditAssigner,
     Messages,
+    GenerateResult,
 )
 
 
-async def elo_match_reward(rollout: Rollout, arena: Arena) -> Dict[str, float]:
+async def match_reward(rollout: Rollout, arena: Arena) -> Dict[str, float]:
     """
     Head-to-head comparison using LLM judge.
-    Returns zero-sum rewards and updates arena Elo ratings.
+    Returns zero-sum rewards.
     """
     extras = rollout.extras
-    player0 = extras.get("player0_role", "Player0")
-    player1 = extras.get("player1_role", "Player1")
+    player0 = extras.get("player0_actor", "Player0")
+    player1 = extras.get("player1_actor", "Player1")
     challenge = rollout.artifact.get("challenge", "")
 
     response0 = extras.get("response0", "")
@@ -62,7 +60,7 @@ Which response is better? Consider: accuracy, clarity, completeness, and creativ
 Respond with ONLY a JSON object: {{"winner": "A" or "B" or "tie", "reason": "<brief reason>"}}"""},
     ]
 
-    response = await arena.call_model(judge_prompt, temperature=0.3, max_tokens=200)
+    response = await arena.call_model(judge_prompt, max_tokens=200)
 
     # Parse winner
     try:
@@ -77,28 +75,21 @@ Respond with ONLY a JSON object: {{"winner": "A" or "B" or "tie", "reason": "<br
     except:
         winner = "TIE"
 
-    # Assign rewards
+    # Assign zero-sum rewards
     if winner == "A":
         rewards = {player0: 1.0, player1: -1.0}
-        winner_role, loser_role = player0, player1
     elif winner == "B":
         rewards = {player0: -1.0, player1: 1.0}
-        winner_role, loser_role = player1, player0
     else:
         rewards = {player0: 0.0, player1: 0.0}
-        winner_role, loser_role = None, None
-
-    # Update Elo ratings if arena has them
-    if hasattr(arena, "elo_ratings") and winner_role:
-        arena.update_elo(winner_role, loser_role)
 
     if arena.verbose:
-        print(f"    [elo_match] winner={winner} | {player0} vs {player1}")
+        print(f"    [match] winner={winner} | {player0} vs {player1}")
 
     return rewards
 
 
-class EloMatchEpisode(Episode):
+class MatchEpisode(Episode):
     """
     Single head-to-head match in the tournament.
 
@@ -110,16 +101,16 @@ class EloMatchEpisode(Episode):
 
     def __init__(
         self,
-        player0_role: str = "Player0",
-        player1_role: str = "Player1",
+        player0_actor: str = "Player0",
+        player1_actor: str = "Player1",
     ):
-        self.player0_role = player0_role
-        self.player1_role = player1_role
-        self._rubric = Rubric(funcs=[elo_match_reward])
+        self.player0_actor = player0_actor
+        self.player1_actor = player1_actor
+        self._rubric = Rubric(funcs=[match_reward])
 
     @property
     def episode_type(self) -> str:
-        return "elo_match"
+        return "match"
 
     @property
     def rubric(self) -> Rubric:
@@ -136,24 +127,24 @@ class EloMatchEpisode(Episode):
 
         challenge = artifact.get("challenge", "")
 
-        # Store role info
-        state.data["player0_role"] = self.player0_role
-        state.data["player1_role"] = self.player1_role
+        # Store actor info
+        state.data["player0_actor"] = self.player0_actor
+        state.data["player1_actor"] = self.player1_actor
 
         # Both players respond to the same challenge
-        for i, role_id in enumerate([self.player0_role, self.player1_role]):
-            role_config = arena.roles.get(role_id)
+        for i, actor_id in enumerate([self.player0_actor, self.player1_actor]):
+            actor_config = arena.actors.get(actor_id)
             prompt = [
-                {"role": "system", "content": role_config.system_prompt if role_config else "You are a creative competitor."},
+                {"role": "system", "content": actor_config.system_prompt if actor_config else "You are a creative competitor."},
                 {"role": "user", "content": f"Challenge: {challenge}\n\nProvide your best response."},
             ]
 
-            response = await self.call_model(role_id, prompt, arena)
+            response = await self.call_model(actor_id, prompt, arena)
             state.data[f"response{i}"] = response.text
 
             # Create Step and append to trajectory for training
             step = Step(
-                role_id=role_id,
+                actor_id=actor_id,
                 prompt=prompt,
                 completion=response.completion,
                 prompt_token_ids=response.prompt_token_ids,
@@ -167,17 +158,11 @@ class EloMatchEpisode(Episode):
 
     def get_extras(self, state: EpisodeState) -> Dict[str, Any]:
         return {
-            "player0_role": state.data.get("player0_role", self.player0_role),
-            "player1_role": state.data.get("player1_role", self.player1_role),
+            "player0_actor": state.data.get("player0_actor", self.player0_actor),
+            "player1_actor": state.data.get("player1_actor", self.player1_actor),
             "response0": state.data.get("response0", ""),
             "response1": state.data.get("response1", ""),
         }
-
-
-async def challenge_proposer_reward(rollout: Rollout, arena: Arena) -> Dict[str, float]:
-    """Empty reward function - proposer episodes are not trained."""
-    # Must return a score for all actors, even though this episode is non-trainable
-    return {actor: 0.0 for actor in rollout.actors}
 
 
 class ChallengeProposerEpisode(Episode):
@@ -185,7 +170,7 @@ class ChallengeProposerEpisode(Episode):
     Non-trainable episode that generates new challenges for the arena.
 
     Pulls example challenges from the store, asks the model to generate
-    a new creative challenge, and adds it to the store.
+    a new creative challenge, and adds it to the store via generate().
 
     Artifact format (input):
     {
@@ -193,9 +178,9 @@ class ChallengeProposerEpisode(Episode):
     }
     """
 
-    def __init__(self, proposer_role: str = "ChallengeProposer"):
-        self.proposer_role = proposer_role
-        self._rubric = Rubric(funcs=[challenge_proposer_reward])
+    def __init__(self, proposer_actor: str = "ChallengeProposer"):
+        self.proposer_actor = proposer_actor
+        self._rubric = Rubric(funcs=[])  # Non-trainable, defaults to 0 reward
 
     @property
     def episode_type(self) -> str:
@@ -219,10 +204,10 @@ class ChallengeProposerEpisode(Episode):
         prompt = self._build_prompt(arena, examples)
 
         # Generate new challenge
-        response = await self.call_model(self.proposer_role, prompt, arena)
+        response = await self.call_model(self.proposer_actor, prompt, arena)
 
         step = Step(
-            role_id=self.proposer_role,
+            actor_id=self.proposer_actor,
             prompt=prompt,
             completion=response.completion,
             prompt_token_ids=response.prompt_token_ids,
@@ -231,25 +216,37 @@ class ChallengeProposerEpisode(Episode):
         )
         state.trajectory.append(step)
 
-        # Parse and store new challenge
-        new_challenge = self._parse_challenge(response.text)
-        state.data["proposed_challenge"] = new_challenge
-
-        if new_challenge and new_challenge.get("challenge"):
-            if "challenges" in arena.stores:
-                challenge_id = f"gen_{arena.stores['challenges'].count()}"
-                arena.stores["challenges"].add(Artifact(
-                    id=challenge_id,
-                    data=new_challenge,
-                ))
-                if arena.verbose:
-                    print(f"    [challenge_proposer] added: {new_challenge['challenge'][:50]}...")
+        # Store proposed challenge in state
+        state.data["proposed_challenge"] = {"challenge": response.text.strip()}
 
         state.done = True
         return state
 
+    async def generate(
+        self,
+        arena: Arena,
+        artifact: Any,
+        meta: Optional[Dict[str, Any]] = None,
+        is_trainable: bool = True,
+    ) -> GenerateResult:
+        result = await super().generate(arena, artifact, meta=meta, is_trainable=is_trainable)
+
+        # Add valid challenge to store
+        proposed = result.rollout.extras.get("proposed_challenge")
+        if proposed and proposed.get("challenge"):  # Check challenge isn't empty
+            if "challenges" in arena.stores:
+                challenge_id = f"gen_{arena.stores['challenges'].count()}"
+                arena.stores["challenges"].add(Artifact(
+                    id=challenge_id,
+                    data=proposed,
+                ))
+                if arena.verbose:
+                    print(f"    [challenge_proposer] added: {proposed['challenge'][:50]}...")
+
+        return result
+
     def _build_prompt(self, arena: Arena, examples: List[Dict]) -> Messages:
-        role = arena.roles.get(self.proposer_role)
+        actor = arena.actors.get(self.proposer_actor)
 
         examples_text = ""
         if examples:
@@ -264,27 +261,14 @@ class ChallengeProposerEpisode(Episode):
 3. Be different from the examples above
 4. Be answerable in 1-3 sentences
 
-Respond with ONLY a JSON object:
-{{"challenge": "<the challenge text>"}}
-
-Do NOT use markdown code blocks. Output ONLY the JSON object."""
+Respond with ONLY the challenge text. No other commentary or formatting."""
 
         messages: Messages = []
-        if role and role.system_prompt:
-            messages.append({"role": "system", "content": role.system_prompt})
+        if actor and actor.system_prompt:
+            messages.append({"role": "system", "content": actor.system_prompt})
         messages.append({"role": "user", "content": user_content})
 
         return messages
-
-    def _parse_challenge(self, text: str) -> Optional[Dict[str, str]]:
-        try:
-            if "{" in text:
-                start = text.index("{")
-                end = text.rindex("}") + 1
-                return json.loads(text[start:end])
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return None
 
     def get_extras(self, state: EpisodeState) -> Dict[str, Any]:
         return {
@@ -292,69 +276,29 @@ Do NOT use markdown code blocks. Output ONLY the JSON object."""
         }
 
 
-class EloArena(Arena):
+class HeadToHeadArena(Arena):
     """
-    Tournament arena with persistent Elo ratings.
+    Tournament arena for head-to-head competition.
 
-    Tracks ratings across batches and logs progression.
+    Runs matches where both players respond to the same challenge,
+    with an LLM judge picking the winner.
     """
 
     def __init__(
         self,
         client: InferenceClient,
-        batch_size: int = 4,
-        proposer_batch_size: int = 1,
-        initial_elo: float = 1500.0,
-        k_factor: float = 32.0,
+        episodes_per_step: int = 4,
+        proposer_episodes_per_step: int = 1,
         verbose: bool = False,
         credit_assigner: CreditAssigner | None = None,
     ):
         super().__init__(
             client,
-            credit_assigner=credit_assigner or RAECredit(decay=0.9),
+            credit_assigner=credit_assigner or GRPOCredit(),
             verbose=verbose,
         )
-        self.batch_size = batch_size
-        self.proposer_batch_size = proposer_batch_size
-        self.initial_elo = initial_elo
-        self.k_factor = k_factor
-
-        # Persistent Elo ratings
-        self.elo_ratings: Dict[str, float] = {}
-        self.match_history: List[Dict] = []
-
-    def get_elo(self, player: str) -> float:
-        """Get Elo rating for a player, initializing if needed."""
-        if player not in self.elo_ratings:
-            self.elo_ratings[player] = self.initial_elo
-        return self.elo_ratings[player]
-
-    def update_elo(self, winner: str, loser: str) -> None:
-        """Update Elo ratings after a match."""
-        winner_elo = self.get_elo(winner)
-        loser_elo = self.get_elo(loser)
-
-        # Expected scores
-        exp_winner = 1.0 / (1.0 + math.pow(10, (loser_elo - winner_elo) / 400))
-        exp_loser = 1.0 - exp_winner
-
-        # Update ratings
-        self.elo_ratings[winner] = winner_elo + self.k_factor * (1.0 - exp_winner)
-        self.elo_ratings[loser] = loser_elo + self.k_factor * (0.0 - exp_loser)
-
-        # Log
-        self.match_history.append({
-            "winner": winner,
-            "loser": loser,
-            "winner_elo_before": winner_elo,
-            "loser_elo_before": loser_elo,
-            "winner_elo_after": self.elo_ratings[winner],
-            "loser_elo_after": self.elo_ratings[loser],
-        })
-
-        if self.verbose:
-            print(f"    [elo] {winner}: {winner_elo:.0f} -> {self.elo_ratings[winner]:.0f} | "
-                  f"{loser}: {loser_elo:.0f} -> {self.elo_ratings[loser]:.0f}")
+        self.episodes_per_step = episodes_per_step
+        self.proposer_episodes_per_step = proposer_episodes_per_step
 
     def get_batch(self) -> List[EpisodeRequest]:
         """Sample challenges from store and include proposer requests."""
@@ -363,15 +307,15 @@ class EloArena(Arena):
             return []
 
         # Sample challenges for matches
-        challenges = store.sample(k=self.batch_size)
+        challenges = store.sample(k=self.episodes_per_step)
         match_requests = [
-            EpisodeRequest(episode_type="elo_match", artifact=c.data)
+            EpisodeRequest(episode_type="match", artifact=c.data)
             for c in challenges
         ]
 
         # Add proposer requests (non-trainable) to generate new challenges
         proposer_requests = []
-        for _ in range(self.proposer_batch_size):
+        for _ in range(self.proposer_episodes_per_step):
             examples = store.sample(k=min(3, store.count()))
             proposer_requests.append(EpisodeRequest(
                 episode_type="challenge_propose",

@@ -1,48 +1,89 @@
 """
-Example: Training a SPICE (Self-Play In Corpus Environment) agent with RL.
+SPICE: Self-Play In Corpus Environment.
 
-This script demonstrates how to train proposer and solver agents using
-corpus-grounded question generation. Inspired by the SPICE paper (arXiv:2510.24684).
+Trains proposer and solver agents using corpus-grounded question generation.
+Inspired by the SPICE paper (arXiv:2510.24684).
 
 Key concepts:
 - Proposer reads documents and generates questions
 - Solver answers questions without access to source documents
 - Proposer is rewarded for questions at the frontier of solver capability (~50% pass rate)
 - Solver is rewarded via LLM-as-judge for correctness
+- Example of how to use llm as a judge for a solver episode
+- Example of how solver episodes can be used as training examples (compare to proposer_solver.py which does NOT train on solver episodes)
 
-To run this example:
-1. Start mlx-vllm server with LoRA enabled:
-   MLX_VLLM_LORA_RANK=8 MLX_VLLM_LORA_LAYERS=16 \
-   python -m uvicorn mlx_vllm.server:app --port 8000
+To run:
+1. Configure LoRA parameters in src/self_play/lora.py
 
 2. Set your OpenRouter API key (for the LLM judge):
    export OPENROUTER_API_KEY=your-key-here
 
-3. Run this script:
-   python examples/train_spice.py --dry-run  # Preview without training
-   python examples/train_spice.py            # Full training
+3. Start inference server:
+   self-play serve --model /path/to/model
+
+4. Run training:
+   uv run examples/train_spice.py
 """
 import asyncio
 import argparse
 import json
 from pathlib import Path
 
-import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
 from mlx_lm import load
-from mlx_lm.tuner.utils import linear_to_lora_layers
 
-from self_play.core import OpenAIClient, Role, Artifact
+from self_play.core import OpenAIClient, Actor, Artifact
+from self_play.lora import apply_lora, print_trainable_params
 from self_play.tasks.spice import SpiceArena, SpiceProposerEpisode, SpiceSolverEpisode
 from self_play.training import (
     Trainer,
     TrainerConfig,
-    WeightPublisher,
     training_loop,
-    simple_training_loop,
+    synchronous_training_loop,
 )
+
+
+# =============================================================================
+# CONFIGURATION - Edit these values directly
+# =============================================================================
+
+# Model
+MODEL_PATH = "mlx_model"
+
+# Inference server
+INFERENCE_URL = "http://localhost:8000"
+
+# Corpus
+CORPUS_PATH = Path(__file__).parent.parent / "sample_data" / "spice_corpus.json"
+
+# Task settings
+N_SOLVER_ROLLOUTS = 4     # Solver attempts per proposed question
+TARGET_PASS_RATE = 0.5    # Target solver pass rate for proposer reward
+
+# Generation (per arena.step())
+EPISODES_PER_STEP = 4     # Proposer episodes per arena.step()
+EPISODE_CONCURRENCY = 4   # Max concurrent episodes
+STEP_CONCURRENCY = 1      # Max concurrent arena.step() calls
+
+# Training
+NUM_STEPS = 100
+LR = 1e-5
+MIN_SAMPLES_PER_STEP = 32  # Records needed before optimizer step
+MICRO_BATCH_TOKENS = 2048  # Max tokens per micro-batch
+STALENESS_LIMIT = 2        # Discard records older than N steps
+
+# KL regularization
+KL_COEF = 0.1
+USE_KL_PENALTY = False
+
+# Training mode
+USE_SIMPLE_LOOP = False  # True for sequential, False for async
+
+# Logging
+WANDB_PROJECT = None  # Set to enable W&B logging
+WANDB_RUN_NAME = None
+
+# =============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -62,41 +103,17 @@ Think step by step when needed, then provide a clear final answer.
 Always end your response with: "The answer is: " followed by your answer."""
 
 
-# Default corpus path (relative to repo root)
-DEFAULT_CORPUS_PATH = Path(__file__).parent.parent / "sample_data" / "spice_corpus.json"
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_model_with_lora(
-    model_path: str,
-    lora_rank: int = 16,
-    lora_layers: int = 16,
-    lora_scale: float = 32.0,
-    lora_dropout: float = 0.05,
-):
+def load_model_with_lora(model_path: str):
     """Load model and attach LoRA adapters."""
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    # Defaults match official LiquidAI/PEFT recommendations
-    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
-
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
-    lora_config = {
-        "rank": lora_rank,
-        "scale": lora_scale,
-        "dropout": lora_dropout,
-        "keys": lora_keys,
-    }
-    linear_to_lora_layers(model, lora_layers, lora_config)
-
-    trainable_params = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
-    total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
-          f"({100 * trainable_params / total_params:.2f}%)")
+    apply_lora(model, inference_mode=False)
+    print_trainable_params(model)
 
     return model, tokenizer
 
@@ -144,7 +161,7 @@ async def preview_spice(arena, concurrency: int = 4):
     propose_stats = {"rewards": [], "pass_rates": []}
     solve_stats = {"correct": 0, "total": 0, "rewards": []}
 
-    for i, (rid, data) in enumerate(episodes.items(), 1):
+    for i, (_, data) in enumerate(episodes.items(), 1):
         meta = data["meta"]
         episode_type = meta.get("episode_type", "?")
         extras = meta.get("extras", {})
@@ -215,50 +232,39 @@ async def preview_spice(arena, concurrency: int = 4):
 
 async def main(args):
     # Load corpus
-    corpus_path = args.corpus_file or DEFAULT_CORPUS_PATH
-    print(f"Loading corpus from {corpus_path}...")
-    corpus = load_corpus_from_file(str(corpus_path))
-
+    print(f"Loading corpus from {CORPUS_PATH}...")
+    corpus = load_corpus_from_file(str(CORPUS_PATH))
     print(f"Corpus size: {len(corpus)} documents\n")
 
-    # Setup inference server URL
-    base_url = args.url if args.url else f"http://{args.host}:{args.port}"
-    print(f"Connecting to inference server at {base_url}...")
-
-    # Setup inference client
-    if args.url:
-        client = OpenAIClient(
-            api_key="not-needed",
-            model="local",
-            base_url=f"{base_url.rstrip('/')}/v1",
-            timeout=120.0,
-        )
-    else:
-        client = OpenAIClient.for_local(host=args.host, port=args.port, timeout=120.0)
+    # Setup client
+    print(f"Connecting to inference server at {INFERENCE_URL}...")
+    client = OpenAIClient(
+        api_key="not-needed",
+        model="local",
+        base_url=f"{INFERENCE_URL.rstrip('/')}/v1",
+        timeout=120.0,
+    )
 
     # Setup arena
-    print("Setting up SPICE arena...")
-    arena = SpiceArena(client=client, batch_size=args.batch_size, verbose=args.verbose)
+    arena = SpiceArena(client=client, batch_size=EPISODES_PER_STEP, verbose=args.verbose)
 
-    # Add roles
-    arena.add_role(Role(
+    # Add actors
+    arena.add_actor(Actor(
         id="Proposer",
         system_prompt=PROPOSER_SYSTEM,
-        temperature=0.9,
         max_tokens=512,
     ))
 
-    arena.add_role(Role(
+    arena.add_actor(Actor(
         id="Solver",
         system_prompt=SOLVER_SYSTEM,
-        temperature=0.7,
         max_tokens=1024,
     ))
 
     # Add episodes
     arena.add_episode("spice_propose", SpiceProposerEpisode(
-        n_solver_rollouts=args.n_solver_rollouts,
-        target_pass_rate=args.target_pass_rate,
+        n_solver_rollouts=N_SOLVER_ROLLOUTS,
+        target_pass_rate=TARGET_PASS_RATE,
     ))
     arena.add_episode("spice_solve", SpiceSolverEpisode())
 
@@ -273,65 +279,48 @@ async def main(args):
 
     print(f"Loaded {corpus_store.count()} documents into corpus store")
 
-    # Dry-run mode: preview arena performance without training
+    # Dry-run mode
     if args.dry_run:
-        await preview_spice(arena, concurrency=args.concurrency)
+        await preview_spice(arena, concurrency=EPISODE_CONCURRENCY)
         await client.close()
         return
 
     # Load model with LoRA
-    model, tokenizer = load_model_with_lora(
-        model_path=args.model_path,
-        lora_rank=args.lora_rank,
-        lora_layers=args.lora_layers,
-    )
+    model, tokenizer = load_model_with_lora(MODEL_PATH)
 
-    # Setup optimizer
-    optimizer = optim.Adam(learning_rate=args.lr)
-
-    # Setup trainer config
+    # Setup training
+    optimizer = optim.Adam(learning_rate=LR)
     config = TrainerConfig(
-        lr=args.lr,
-        micro_token_budget=args.micro_token_budget,
-        max_policy_lag=args.max_policy_lag,
-        batch_size=args.train_batch_size,
-        clip_low=0.8,
-        clip_high=1.2,
-        kl_coef=args.kl_coef,
-        use_kl_penalty=args.use_kl_penalty,
-        weight_push_url=base_url,
+        lr=LR,
+        micro_batch_tokens=MICRO_BATCH_TOKENS,
+        staleness_limit=STALENESS_LIMIT,
+        min_samples_per_step=MIN_SAMPLES_PER_STEP,
+        ppo_clip_min=0.8,
+        ppo_clip_max=1.2,
+        kl_coef=KL_COEF,
+        use_kl_penalty=USE_KL_PENALTY,
+        inference_url=INFERENCE_URL,
         pad_token_id=tokenizer.pad_token_id or 0,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
+        wandb_project=WANDB_PROJECT,
+        wandb_run_name=WANDB_RUN_NAME,
     )
 
-    # Setup weight publisher
-    publisher = WeightPublisher(base_url=base_url)
+    trainer = Trainer(model=model, optimizer=optimizer, config=config, client=client)
 
-    # Setup trainer
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        config=config,
-        publisher=publisher,
-    )
-
-    print(f"\nStarting SPICE training for {args.num_steps} steps...")
+    print(f"\nStarting SPICE training for {NUM_STEPS} steps...")
     print(f"  - Corpus size: {corpus_store.count()} documents")
-    print(f"  - Batch size: {args.batch_size} proposer episodes per arena step")
-    print(f"  - Solver rollouts per proposal: {args.n_solver_rollouts}")
-    print(f"  - Target pass rate: {args.target_pass_rate:.0%}")
-    print(f"  - Train batch size: {args.train_batch_size} records per train step")
-    print(f"  - Micro token budget: {args.micro_token_budget}")
-    print()
+    print(f"  - Episodes per step: {EPISODES_PER_STEP}")
+    print(f"  - Solver rollouts per proposal: {N_SOLVER_ROLLOUTS}")
+    print(f"  - Target pass rate: {TARGET_PASS_RATE:.0%}")
+    print(f"  - Min samples per step: {MIN_SAMPLES_PER_STEP}")
 
-    if args.simple_loop:
-        await simple_training_loop(
+    if USE_SIMPLE_LOOP:
+        await synchronous_training_loop(
             arena=arena,
             trainer=trainer,
-            num_steps=args.num_steps,
-            concurrency=args.concurrency,
-            step_concurrency=args.step_concurrency,
+            num_steps=NUM_STEPS,
+            episode_concurrency=EPISODE_CONCURRENCY,
+            step_concurrency=STEP_CONCURRENCY,
             verbose=args.verbose,
         )
     else:
@@ -340,14 +329,13 @@ async def main(args):
             arena=arena,
             trainer=trainer,
             batch_queue=batch_queue,
-            num_steps=args.num_steps,
-            concurrency=args.concurrency,
-            step_concurrency=args.step_concurrency,
+            num_steps=NUM_STEPS,
+            episode_concurrency=EPISODE_CONCURRENCY,
+            step_concurrency=STEP_CONCURRENCY,
             verbose=args.verbose,
         )
 
     # Cleanup
-    await publisher.close()
     await client.close()
 
     print(f"\nTraining complete! Final step: {trainer.train_step_idx}")
@@ -355,55 +343,12 @@ async def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train SPICE (Self-Play In Corpus Environment) agents with RL"
-    )
+    parser = argparse.ArgumentParser(description="SPICE: Self-Play In Corpus Environment")
 
-    # Model args
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit",
-        help="Path to the base model",
-    )
-    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora-layers", type=int, default=16, help="LoRA layers")
+    # Only essential CLI args
+    parser.add_argument("--dry-run", action="store_true",
+        help="Run single arena step to preview performance (skips training)")
+    parser.add_argument("--verbose", action="store_true",
+        help="Print debug info")
 
-    # Server args
-    parser.add_argument("--url", type=str, default=None, help="Full base URL of inference server")
-    parser.add_argument("--host", type=str, default="localhost", help="Inference server host")
-    parser.add_argument("--port", type=int, default=8000, help="Inference server port")
-
-    # Corpus args
-    parser.add_argument(
-        "--corpus-file",
-        type=str,
-        default=None,
-        help=f"Path to corpus file (JSON or JSONL). Default: sample_data/spice_corpus.json",
-    )
-
-    # Training args
-    parser.add_argument("--num-steps", type=int, default=10, help="Number of training steps")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=4, help="Proposer episodes per arena step")
-    parser.add_argument("--train-batch-size", type=int, default=24, help="Records per train step")
-    parser.add_argument("--n-solver-rollouts", type=int, default=4, help="Solver rollouts per proposal")
-    parser.add_argument("--target-pass-rate", type=float, default=0.5, help="Target solver pass rate")
-    parser.add_argument("--micro-token-budget", type=int, default=4096, help="Tokens per micro-batch")
-    parser.add_argument("--max-policy-lag", type=int, default=3, help="Max staleness (steps)")
-    parser.add_argument("--kl-coef", type=float, default=0.1, help="KL penalty coefficient")
-    parser.add_argument("--use-kl-penalty", action="store_true", help="Add KL penalty to loss")
-    parser.add_argument("--concurrency", type=int, default=4, help="Max concurrent episodes")
-    parser.add_argument("--step-concurrency", type=int, default=1, help="Max concurrent arena.step() calls")
-
-    # Mode args
-    parser.add_argument("--simple-loop", action="store_true", help="Use simple sequential loop")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without training")
-    parser.add_argument("--verbose", action="store_true", help="Print debug info")
-
-    # Wandb args
-    parser.add_argument("--wandb-project", type=str, default=None, help="Wandb project name")
-    parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name")
-
-    args = parser.parse_args()
-    asyncio.run(main(args))
+    asyncio.run(main(parser.parse_args()))

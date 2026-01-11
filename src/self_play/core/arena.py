@@ -4,6 +4,7 @@ Arena: Orchestration engine for self-play training.
 The Arena orchestrates the training loop:
 1. get_batch() - Define what episodes to run
 2. generate_rollouts() - Execute episodes in parallel
+3. credit_assigner.compute() - Assign credit to steps
 3. build_training_batch() - Convert to trainer-consumable format
 
 Episode state is transient (within one episode).
@@ -21,7 +22,7 @@ from .types import (
     GenerateResult,
     Messages,
     ModelResponse,
-    Role,
+    Actor,
     TrainingBatch,
     TrainingRecord,
 )
@@ -35,7 +36,7 @@ from .clients import InferenceClient
 # ---------------------------------------------------------------------------
 
 class ArtifactStore:
-    """Simple in-memory artifact store with weighted sampling."""
+    """Simple in-memory artifact store."""
 
     def __init__(self, max_size: Optional[int] = None):
         self.max_size = max_size
@@ -49,19 +50,16 @@ class ArtifactStore:
         self._items[artifact.id] = artifact
         self._order.append(artifact.id)
 
-    def sample(self, k: int = 1, weighted: bool = False) -> List[Artifact]:
+    def sample(self, k: int = 1) -> List[Artifact]:
         import random
         items = list(self._items.values())
         if not items:
             return []
         k = min(k, len(items))
-        if weighted:
-            weights = [a.weight for a in items]
-            return random.choices(items, weights=weights, k=k)
         return random.sample(items, k)
 
-    def sample_one(self, weighted: bool = False) -> Optional[Artifact]:
-        results = self.sample(1, weighted)
+    def sample_one(self) -> Optional[Artifact]:
+        results = self.sample(1)
         return results[0] if results else None
 
     def count(self) -> int:
@@ -82,10 +80,12 @@ class Arena:
     Flow:
         requests = arena.get_batch()
         results = await arena.generate_rollouts(requests)
+        weights = arena.credit_assigner.compute(results)
+        apply_credit(results, weights)
         batch = arena.build_training_batch(results)
 
     Rewards are computed by each episode's Rubric during generation.
-    Each step gets the reward for its role.
+    Each step gets the reward for its actor.
     """
 
     def __init__(
@@ -99,7 +99,7 @@ class Arena:
         self.verbose = verbose
 
         # Registries
-        self.roles: Dict[str, Role] = {}
+        self.actors: Dict[str, Actor] = {}
         self.episodes: Dict[str, Episode] = {}
         self.stores: Dict[str, ArtifactStore] = {}
 
@@ -107,8 +107,8 @@ class Arena:
     # Registration
     # ---------------------------------------------------------------------------
 
-    def add_role(self, role: Role) -> None:
-        self.roles[role.id] = role
+    def add_actor(self, actor: Actor) -> None:
+        self.actors[actor.id] = actor
 
     def add_episode(self, episode_type: str, episode: Episode) -> None:
         self.episodes[episode_type] = episode
@@ -126,32 +126,23 @@ class Arena:
     async def call_model(
         self,
         messages: Messages,
-        role_id: Optional[str] = None,
-        temperature: Optional[float] = None,
+        actor_id: Optional[str] = None,
         max_tokens: Optional[int] = None,
-        return_tokens: Optional[bool] = None,
     ) -> ModelResponse:
         """
         Make a model call.
 
-        If role_id is provided, uses the role's config (and returns tokens for training).
-        Otherwise, uses explicit parameters.
+        If actor_id is provided, uses the actor's max_tokens config.
         """
-        if role_id is not None:
-            role = self.roles[role_id]
-            return await self.client.complete(
-                messages=messages,
-                temperature=temperature if temperature is not None else role.temperature,
-                max_tokens=max_tokens if max_tokens is not None else role.max_tokens,
-                return_tokens=True,
-            )
-        else:
-            return await self.client.complete(
-                messages=messages,
-                temperature=temperature if temperature is not None else 1.0,
-                max_tokens=max_tokens,
-                return_tokens=return_tokens if return_tokens is not None else False,
-            )
+        if actor_id is not None:
+            actor = self.actors[actor_id]
+            max_tokens = max_tokens if max_tokens is not None else actor.max_tokens
+
+        return await self.client.complete(
+            messages=messages,
+            max_tokens=max_tokens,
+            return_tokens=True,
+        )
 
     # ---------------------------------------------------------------------------
     # Batch Definition (override for custom scheduling)
@@ -164,7 +155,6 @@ class Arena:
         Override this to implement custom scheduling logic:
         - For debate: pull next N topics
         - For propose/solve: schedule proposer episodes (solvers nested inside)
-        - For ordered execution: return requests with ordering metadata
 
         Default: returns empty list (override in subclass).
         """
@@ -252,7 +242,7 @@ class Arena:
                 action_mask = [0] * len(step.prompt_token_ids) + [1] * len(step.completion_token_ids)
 
                 records.append(TrainingRecord(
-                    role_id=step.role_id,
+                    actor_id=step.actor_id,
                     rollout_id=rollout.id,
                     prompt_token_ids=step.prompt_token_ids,
                     completion_token_ids=step.completion_token_ids,
@@ -318,10 +308,10 @@ class Arena:
     # Lifecycle
     # ---------------------------------------------------------------------------
 
-    async def startup(self) -> None:
-        """Called before training starts. Override for warmup."""
+    async def on_train_start(self) -> None:
+        """Called before training starts. Override for warmup/initialization."""
         pass
 
-    async def shutdown(self) -> None:
+    async def on_train_end(self) -> None:
         """Called after training ends. Override for cleanup."""
         pass

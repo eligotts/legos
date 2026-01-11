@@ -183,8 +183,8 @@ class SpiceSolverEpisode(SingleTurnEpisode):
     }
     """
 
-    def __init__(self, solver_role_id: str = "Solver"):
-        self.solver_role_id = solver_role_id
+    def __init__(self, solver_actor_id: str = "Solver"):
+        self.solver_actor_id = solver_actor_id
         self._rubric = Rubric(funcs=[solver_llm_judge_reward])
 
     @property
@@ -196,7 +196,7 @@ class SpiceSolverEpisode(SingleTurnEpisode):
         return self._rubric
 
     def get_initial_actor(self, artifact: Any, state: EpisodeState) -> str:
-        return self.solver_role_id
+        return self.solver_actor_id
 
     def get_initial_prompt(
         self,
@@ -237,11 +237,11 @@ class SpiceProposerEpisode(Episode):
 
     def __init__(
         self,
-        proposer_role_id: str = "Proposer",
+        proposer_actor_id: str = "Proposer",
         n_solver_rollouts: int = 4,
         target_pass_rate: float = 0.5,
     ):
-        self.proposer_role_id = proposer_role_id
+        self.proposer_actor_id = proposer_actor_id
         self.n_solver_rollouts = n_solver_rollouts
         self.target_pass_rate = target_pass_rate
         self._rubric = Rubric(funcs=[proposer_pass_rate_reward])
@@ -274,10 +274,10 @@ class SpiceProposerEpisode(Episode):
 
         # 2. Build prompt and generate Q&A
         prompt = self._build_prompt(arena, doc_text, doc_title)
-        response = await self.call_model(self.proposer_role_id, prompt, arena)
+        response = await self.call_model(self.proposer_actor_id, prompt, arena)
 
         step = Step(
-            role_id=self.proposer_role_id,
+            actor_id=self.proposer_actor_id,
             prompt=prompt,
             completion=response.completion,
             prompt_token_ids=response.prompt_token_ids,
@@ -335,7 +335,7 @@ class SpiceProposerEpisode(Episode):
         return result
 
     def _build_prompt(self, arena: Arena, doc_text: str, doc_title: str = "") -> Messages:
-        role = arena.roles.get(self.proposer_role_id)
+        actor = arena.actors.get(self.proposer_actor_id)
 
         title_line = f"Title: {doc_title}\n\n" if doc_title else ""
 
@@ -363,8 +363,8 @@ CRITICAL INSTRUCTIONS:
 - The ground_truth should be concise (a word, phrase, or number)"""
 
         messages: Messages = []
-        if role and role.system_prompt:
-            messages.append({"role": "system", "content": role.system_prompt})
+        if actor and actor.system_prompt:
+            messages.append({"role": "system", "content": actor.system_prompt})
         messages.append({"role": "user", "content": user_content})
 
         return messages

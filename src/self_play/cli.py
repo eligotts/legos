@@ -1,19 +1,16 @@
 """
-Unified CLI for the self-play engine.
+CLI for the self-play engine.
 
 Usage:
     self-play serve [OPTIONS]     Start the inference server
     self-play --help              Show help
 
 Examples:
-    # Start inference server with default settings
     self-play serve
-
-    # Start with custom model and LoRA
-    self-play serve --model /path/to/model --lora-rank 8
-
-    # Start on custom port
+    self-play serve --model /path/to/model
     self-play serve --port 8080
+
+LoRA settings are configured in src/self_play/lora.py
 """
 
 import argparse
@@ -39,12 +36,6 @@ def serve_command(args: argparse.Namespace) -> None:
         config_overrides["max_batch_size"] = args.max_batch_size
     if args.max_tokens:
         config_overrides["max_tokens"] = args.max_tokens
-    if args.lora_rank:
-        config_overrides["lora_rank"] = args.lora_rank
-    if args.lora_layers:
-        config_overrides["lora_layers"] = args.lora_layers
-    if args.lora_scale:
-        config_overrides["lora_scale"] = args.lora_scale
     # Sampler args
     if args.temperature is not None:
         config_overrides["temperature"] = args.temperature
@@ -64,8 +55,7 @@ def serve_command(args: argparse.Namespace) -> None:
     print(f"  Max batch size: {config.max_batch_size}")
     print(f"  Default max tokens: {config.max_tokens}")
     print(f"  Sampler: temp={config.temperature}, top_p={config.top_p}, top_k={config.top_k}, rep_penalty={config.repetition_penalty}")
-    if config.lora_rank:
-        print(f"  LoRA: rank={config.lora_rank}, layers={config.lora_layers}, scale={config.lora_scale}")
+    print(f"  LoRA: {'enabled' if config.enable_lora else 'disabled'}")
 
     uvicorn.run(
         "self_play.inference.server:app",
@@ -83,11 +73,11 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  self-play serve                      Start inference server with defaults
+  self-play serve                      Start inference server
   self-play serve --model /path/to/m   Use custom model
-  self-play serve --lora-rank 8        Enable LoRA with rank 8
+  self-play serve --port 8080          Use custom port
 
-For more information, see: https://github.com/eligottlieb/self-play-engine
+LoRA settings: edit src/self_play/lora.py
         """,
     )
 
@@ -127,24 +117,6 @@ For more information, see: https://github.com/eligottlieb/self-play-engine
         type=int,
         default=None,
         help="Default max tokens per request (default: 4096)",
-    )
-    serve_parser.add_argument(
-        "--lora-rank",
-        type=int,
-        default=None,
-        help="Enable LoRA with this rank (required for online weight updates)",
-    )
-    serve_parser.add_argument(
-        "--lora-layers",
-        type=int,
-        default=None,
-        help="Number of layers to apply LoRA to (default: 16)",
-    )
-    serve_parser.add_argument(
-        "--lora-scale",
-        type=float,
-        default=None,
-        help="LoRA scaling factor (default: 20.0)",
     )
     # Sampler arguments
     serve_parser.add_argument(

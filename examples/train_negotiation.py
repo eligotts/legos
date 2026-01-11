@@ -1,12 +1,5 @@
 """
-Example: Training negotiation agents with RL.
-
-This script demonstrates how to use the self-play training module to train
-negotiation agents using SPIRAL's SimpleNegotiation environment. It combines:
-- The NegotiationArena from the tasks module (for generation)
-- The Trainer from the training module (for training)
-- An mlx-vllm server for inference (with LoRA hot-swap)
-- RAECredit for role-conditioned advantage estimation
+Negotiation: Train negotiation agents with RL (SPIRAL SimpleNegotiation arXiv:2506.24119).
 
 The game:
 - Two players with opposite resource preferences
@@ -16,33 +9,75 @@ The game:
 - Players negotiate and trade to maximize their inventory value
 - Winner = player with larger inventory value change
 
-To run this example:
-1. Start mlx-vllm server with LoRA enabled:
-   MLX_VLLM_LORA_RANK=8 MLX_VLLM_LORA_LAYERS=16 \\
-   python -m uvicorn mlx_vllm.server:app --port 8000
+To run:
+1. Configure LoRA parameters in src/self_play/lora.py
 
-2. Run this script:
-   python examples/train_negotiation.py
+2. Start inference server:
+   self-play serve --model /path/to/model
+
+3. Run training:
+   uv run examples/train_negotiation.py
 """
 import asyncio
 import argparse
 
-import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
 from mlx_lm import load
-from mlx_lm.tuner.utils import linear_to_lora_layers
 
-from self_play.core import OpenAIClient, Role, RAECredit
+from self_play.core import OpenAIClient, Actor, RAECredit
+from self_play.lora import apply_lora, print_trainable_params
 from self_play.tasks.negotiation import NegotiationArena, NegotiationEpisode
 from self_play.training import (
     Trainer,
     TrainerConfig,
-    WeightPublisher,
     training_loop,
-    simple_training_loop,
+    synchronous_training_loop,
 )
+
+
+# =============================================================================
+# CONFIGURATION - Edit these values directly
+# =============================================================================
+
+# Model
+MODEL_PATH = "mlx_model"
+
+# Inference server
+INFERENCE_URL = "http://localhost:8000"
+
+# Game settings
+MAX_GAME_TURNS = 6
+
+# Generation (per arena.step())
+EPISODES_PER_STEP = 4     # Games per arena.step()
+EPISODE_CONCURRENCY = 4   # Max concurrent episodes
+STEP_CONCURRENCY = 1      # Max concurrent arena.step() calls
+
+# Training
+NUM_STEPS = 100
+LR = 1e-5
+MIN_SAMPLES_PER_STEP = 32  # Records needed before optimizer step
+MICRO_BATCH_TOKENS = 2048  # Max tokens per micro-batch
+STALENESS_LIMIT = 2        # Discard records older than N steps
+
+# KL regularization
+KL_COEF = 0.1
+USE_KL_PENALTY = False
+
+# RAE credit assignment
+RAE_DECAY = 0.95
+
+# Generation parameters
+MAX_TOKENS = 512
+
+# Training mode
+USE_SIMPLE_LOOP = False  # True for sequential, False for async
+
+# Logging
+WANDB_PROJECT = None  # Set to enable W&B logging
+WANDB_RUN_NAME = None
+
+# =============================================================================
 
 
 # System prompts for each player
@@ -99,46 +134,13 @@ IMPORTANT:
 - Your output must end with exactly one action: [Offer: ...], [Accept], or [Deny]."""
 
 
-def load_model_with_lora(
-    model_path: str,
-    lora_rank: int = 16,
-    lora_layers: int = 16,
-    lora_scale: float = 32.0,
-    lora_dropout: float = 0.05,
-):
-    """
-    Load model and attach LoRA adapters.
-
-    Args:
-        model_path: Path to the base model
-        lora_rank: LoRA rank (must match server config)
-        lora_layers: Number of layers to apply LoRA to
-        lora_scale: LoRA scaling factor (lora_alpha in PEFT)
-        lora_dropout: LoRA dropout
-
-    Returns:
-        Tuple of (model, tokenizer)
-    """
+def load_model_with_lora(model_path: str):
+    """Load model and attach LoRA adapters."""
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    # Defaults match official LiquidAI/PEFT recommendations
-    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
-
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
-    lora_config = {
-        "rank": lora_rank,
-        "scale": lora_scale,
-        "dropout": lora_dropout,
-        "keys": lora_keys,
-    }
-    linear_to_lora_layers(model, lora_layers, lora_config)
-
-    # Count trainable parameters
-    trainable_params = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
-    total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
-          f"({100 * trainable_params / total_params:.2f}%)")
+    apply_lora(model, inference_mode=False)
+    print_trainable_params(model)
 
     return model, tokenizer
 
@@ -169,28 +171,24 @@ async def preview_negotiation(arena, concurrency: int = 4):
     total_value_changes = {"Player0": [], "Player1": []}
     winners = {"Player0": 0, "Player1": 0, "Draw": 0}
 
-    for i, (rid, data) in enumerate(games.items(), 1):
+    for i, (_, data) in enumerate(games.items(), 1):
         meta = data["meta"]
         extras = meta.get("extras", {})
 
-        # Game outcome
         winner = extras.get("winner", "?")
         if winner in winners:
             winners[winner] += 1
         else:
             winners["Draw"] += 1
 
-        # Value changes per player
         value_changes = extras.get("value_changes", {})
         for player, change in value_changes.items():
             if player in total_value_changes:
                 total_value_changes[player].append(change)
 
-        # Trades made
         trades = extras.get("trades", [])
         num_trades = len(trades) if trades else 0
 
-        # Compute game-level rewards based on outcome
         invalid_player = extras.get("invalid_action")
         if invalid_player:
             game_rewards = {
@@ -204,49 +202,27 @@ async def preview_negotiation(arena, concurrency: int = 4):
         else:
             game_rewards = {"Player0": 0.0, "Player1": 0.0}
 
-        # Count turns per player
         turn_counts = {"Player0": 0, "Player1": 0}
         for rec in data["records"]:
-            if rec.role_id in turn_counts:
-                turn_counts[rec.role_id] += 1
+            if rec.actor_id in turn_counts:
+                turn_counts[rec.actor_id] += 1
 
         rewards_str = ", ".join(f"{p}: {r:+.1f}" for p, r in sorted(game_rewards.items()))
         turns_str = ", ".join(f"{p}: {c}" for p, c in sorted(turn_counts.items()))
         print(f"[{i}] Winner: {winner} | Trades: {num_trades} | Rewards: {rewards_str} | Turns: {turns_str}")
 
-        # Show value changes
         if value_changes:
             changes_str = ", ".join(f"{p}: {c:+.0f}" for p, c in value_changes.items())
             print(f"    Value changes: {changes_str}")
 
-        # Show final inventories
         final_inventories = extras.get("player_resources", {})
         if final_inventories:
             for player, inv in final_inventories.items():
                 inv_str = ", ".join(f"{k}={v}" for k, v in inv.items())
                 print(f"    {player} inventory: {inv_str}")
 
-        # Show trade history (truncated)
-        if trades:
-            for j, trade in enumerate(trades[:2]):  # Show first 2 trades
-                print(f"    Trade {j+1}: {truncate(str(trade), 80)}")
-            if len(trades) > 2:
-                print(f"    ... and {len(trades) - 2} more trades")
-
-        # Show sample dialogue
-        dialogue = extras.get("dialogue", [])
-        if dialogue:
-            print("    Sample dialogue:")
-            for msg in dialogue[:3]:  # Show first 3 messages
-                role = msg.get("role", "?")
-                content = msg.get("content", "")
-                print(f"      {role}: {truncate(content, 60)}")
-            if len(dialogue) > 3:
-                print(f"      ... and {len(dialogue) - 3} more messages")
-
         print()
 
-    # Summary stats
     print("Game Summary:")
     print(f"  Winners: Player0={winners['Player0']}, Player1={winners['Player1']}, Draw={winners['Draw']}")
 
@@ -255,7 +231,6 @@ async def preview_negotiation(arena, concurrency: int = 4):
             avg_change = sum(changes) / len(changes)
             print(f"  {player} avg value change: {avg_change:+.1f}")
 
-    # Reward stats
     all_rewards = [r.reward for r in batch.records]
     if all_rewards:
         avg_reward = sum(all_rewards) / len(all_rewards)
@@ -263,190 +238,113 @@ async def preview_negotiation(arena, concurrency: int = 4):
 
 
 async def main(args):
-    # Setup inference server URL
-    base_url = args.url if args.url else f"http://{args.host}:{args.port}"
-    print(f"\nConnecting to inference server at {base_url}...")
-
     # Setup inference client
-    if args.url:
-        client = OpenAIClient(
-            api_key="not-needed",
-            model="local",
-            base_url=f"{base_url.rstrip('/')}/v1",
-            timeout=120.0,
-        )
-    else:
-        client = OpenAIClient.for_local(host=args.host, port=args.port, timeout=120.0)
-
-    # Setup arena with RAECredit for role-conditioned baselines
-    print("Setting up negotiation arena...")
-    arena = NegotiationArena(
-        client=client,
-        batch_size=args.batch_size,
-        verbose=args.verbose,
-        credit_assigner=RAECredit(decay=args.rae_decay),
+    print(f"\nConnecting to inference server at {INFERENCE_URL}...")
+    client = OpenAIClient(
+        api_key="not-needed",
+        model="local",
+        base_url=f"{INFERENCE_URL.rstrip('/')}/v1",
+        timeout=120.0,
     )
 
-    # Add roles with negotiation-specific system prompts
-    arena.add_role(Role(
+    # Setup arena with RAECredit for actor-conditioned baselines
+    arena = NegotiationArena(
+        client=client,
+        episodes_per_step=EPISODES_PER_STEP,
+        verbose=args.verbose,
+        credit_assigner=RAECredit(decay=RAE_DECAY),
+    )
+
+    # Add actors with negotiation-specific system prompts
+    arena.add_actor(Actor(
         id="Player0",
         system_prompt=PLAYER_0_SYSTEM_PROMPT,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
+        max_tokens=MAX_TOKENS,
     ))
 
-    arena.add_role(Role(
+    arena.add_actor(Actor(
         id="Player1",
         system_prompt=PLAYER_1_SYSTEM_PROMPT,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
+        max_tokens=MAX_TOKENS,
     ))
 
     # Add episode
     arena.add_episode("negotiation", NegotiationEpisode(
-        player_0_role_id="Player0",
-        player_1_role_id="Player1",
-        max_turns=args.max_game_turns,
+        player_0_actor_id="Player0",
+        player_1_actor_id="Player1",
+        max_turns=MAX_GAME_TURNS,
     ))
 
-    # Dry-run mode: preview arena performance without training
+    # Dry-run mode
     if args.dry_run:
-        await preview_negotiation(arena, concurrency=args.concurrency)
+        await preview_negotiation(arena, concurrency=EPISODE_CONCURRENCY)
         await client.close()
         return
 
     # Load model with LoRA
-    model, tokenizer = load_model_with_lora(
-        model_path=args.model_path,
-        lora_rank=args.lora_rank,
-        lora_layers=args.lora_layers,
-    )
-
-    # Setup optimizer
-    optimizer = optim.Adam(learning_rate=args.lr)
-
-    # Setup trainer config
-    config = TrainerConfig(
-        lr=args.lr,
-        micro_token_budget=args.micro_token_budget,
-        max_policy_lag=args.max_policy_lag,
-        batch_size=args.train_batch_size,
-        clip_low=0.8,
-        clip_high=1.2,
-        kl_coef=args.kl_coef,
-        use_kl_penalty=args.use_kl_penalty,
-        weight_push_url=base_url,
-        pad_token_id=tokenizer.pad_token_id or 0,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-    )
-
-    # Setup weight publisher
-    publisher = WeightPublisher(
-        base_url=base_url,
-    )
+    model, tokenizer = load_model_with_lora(MODEL_PATH)
 
     # Setup trainer
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        config=config,
-        publisher=publisher,
+    optimizer = optim.Adam(learning_rate=LR)
+    config = TrainerConfig(
+        lr=LR,
+        micro_batch_tokens=MICRO_BATCH_TOKENS,
+        staleness_limit=STALENESS_LIMIT,
+        min_samples_per_step=MIN_SAMPLES_PER_STEP,
+        ppo_clip_min=0.8,
+        ppo_clip_max=1.2,
+        kl_coef=KL_COEF,
+        use_kl_penalty=USE_KL_PENALTY,
+        inference_url=INFERENCE_URL,
+        pad_token_id=tokenizer.pad_token_id or 0,
+        wandb_project=WANDB_PROJECT,
+        wandb_run_name=WANDB_RUN_NAME,
     )
 
-    print(f"\nStarting training for {args.num_steps} steps...")
-    print(f"  - Game: SimpleNegotiation ({args.max_game_turns} max turns)")
-    print(f"  - Batch size: {args.batch_size} games per arena step")
-    print(f"  - Train batch size: {args.train_batch_size} records per train step")
-    print(f"  - Micro token budget: {args.micro_token_budget}")
-    print(f"  - Max policy lag: {args.max_policy_lag}")
-    print(f"  - RAE decay: {args.rae_decay}")
+    trainer = Trainer(model=model, optimizer=optimizer, config=config, client=client)
+
+    # Run training
+    print(f"\nStarting training for {NUM_STEPS} steps...")
+    print(f"  - Game: SimpleNegotiation ({MAX_GAME_TURNS} max turns)")
+    print(f"  - Episodes per step: {EPISODES_PER_STEP}")
+    print(f"  - Min samples per step: {MIN_SAMPLES_PER_STEP}")
     print()
 
     try:
-        if args.simple_loop:
-            # Use simple sequential loop (easier to debug)
-            await simple_training_loop(
+        if USE_SIMPLE_LOOP:
+            await synchronous_training_loop(
                 arena=arena,
                 trainer=trainer,
-                num_steps=args.num_steps,
-                concurrency=args.concurrency,
-                step_concurrency=args.step_concurrency,
+                num_steps=NUM_STEPS,
+                episode_concurrency=EPISODE_CONCURRENCY,
+                step_concurrency=STEP_CONCURRENCY,
                 verbose=args.verbose,
             )
         else:
-            # Use async loop with queue (better throughput)
             batch_queue = asyncio.Queue(maxsize=4)
             await training_loop(
                 arena=arena,
                 trainer=trainer,
                 batch_queue=batch_queue,
-                num_steps=args.num_steps,
-                concurrency=args.concurrency,
-                step_concurrency=args.step_concurrency,
+                num_steps=NUM_STEPS,
+                episode_concurrency=EPISODE_CONCURRENCY,
+                step_concurrency=STEP_CONCURRENCY,
                 verbose=args.verbose,
             )
     finally:
-        # Cleanup
-        await publisher.close()
         await client.close()
 
     print(f"\nTraining complete! Final step: {trainer.train_step_idx}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train negotiation agents with RL (SPIRAL SimpleNegotiation)")
+    parser = argparse.ArgumentParser(description="Train negotiation agents with RL")
 
-    # Model args
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit",
-        help="Path to the base model",
-    )
-    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora-layers", type=int, default=16, help="LoRA layers")
-
-    # Server args
-    parser.add_argument("--url", type=str, default=None, help="Full base URL of inference server (overrides host/port)")
-    parser.add_argument("--host", type=str, default="localhost", help="Inference server host")
-    parser.add_argument("--port", type=int, default=8000, help="Inference server port")
-
-    # Game args
-    parser.add_argument("--max-game-turns", type=int, default=6, help="Max turns per negotiation game")
-
-    # Training args
-    parser.add_argument("--num-steps", type=int, default=100, help="Number of training steps")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=4, help="Games per arena step")
-    parser.add_argument("--train-batch-size", type=int, default=24, help="Records per train step")
-    parser.add_argument("--micro-token-budget", type=int, default=4096, help="Tokens per micro-batch")
-    parser.add_argument("--max-policy-lag", type=int, default=3, help="Max staleness (steps)")
-    parser.add_argument("--kl-coef", type=float, default=0.1, help="KL penalty coefficient")
-    parser.add_argument("--use-kl-penalty", action="store_true", help="Add KL penalty to loss")
-    parser.add_argument("--concurrency", type=int, default=4, help="Max concurrent episodes")
-    parser.add_argument("--step-concurrency", type=int, default=1, help="Max concurrent arena.step() calls")
-
-    # RAE args
-    parser.add_argument("--rae-decay", type=float, default=0.95, help="RAE baseline EMA decay factor")
-
-    # Generation args
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
-    parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens per completion")
-
-    # Mode args
-    parser.add_argument(
-        "--simple-loop",
-        action="store_true",
-        help="Use simple sequential loop instead of async",
-    )
+    # Only essential CLI args
     parser.add_argument("--dry-run", action="store_true",
         help="Run single arena step to preview performance (skips training)")
-    parser.add_argument("--verbose", action="store_true", help="Print debug info")
-
-    # Wandb args
-    parser.add_argument("--wandb-project", type=str, default=None, help="Wandb project name (enables logging)")
-    parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name")
+    parser.add_argument("--verbose", action="store_true",
+        help="Print debug info")
 
     args = parser.parse_args()
     asyncio.run(main(args))

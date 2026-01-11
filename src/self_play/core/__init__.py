@@ -2,7 +2,7 @@
 Core abstractions for the self-play engine.
 
 Simple, focused:
-- Role: trainable entity
+- Actor: trainable entity
 - Episode: single-turn or multi-turn rollout protocol
 - Rubric: function that scores rollouts
 - Arena: persistent state + orchestration
@@ -12,7 +12,7 @@ from .types import (
     Message,
     Messages,
     # Core types
-    Role,
+    Actor,
     Step,
     Rollout,
     TrainingRecord,
@@ -60,7 +60,7 @@ __all__ = [
     # Types
     "Message",
     "Messages",
-    "Role",
+    "Actor",
     "Step",
     "Rollout",
     "TrainingRecord",

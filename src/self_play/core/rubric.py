@@ -3,7 +3,7 @@ Rubric: Composable reward functions for scoring rollouts.
 
 A Rubric combines multiple reward functions. Each function:
 - Takes (rollout: Rollout, arena: Arena)
-- Returns Dict[str, float] mapping role_id -> reward
+- Returns Dict[str, float] mapping actor_id -> reward
 - Can be sync or async
 
 Example:
@@ -34,7 +34,7 @@ class Rubric:
     Composes multiple reward functions into a single scoring unit.
 
     Each function is called with (rollout, arena) and returns
-    Dict[str, float] mapping role_id -> reward.
+    Dict[str, float] mapping actor_id -> reward.
 
     Results are aggregated with optional weights.
     """
@@ -66,11 +66,12 @@ class Rubric:
         Score a rollout, mutating it in place.
 
         1. Calls each reward function
-        2. Aggregates results (weighted sum per role) into rollout.rewards
-        3. Sets step.reward for each step based on its role_id
+        2. Aggregates results (weighted sum per actor) into rollout.rewards
+        3. Defaults unscored actors to 0.0 reward
+        4. Sets step.reward for each step based on its actor_id
 
-        Raises:
-            ValueError: If any role in rollout.steps has no reward
+        Note: If funcs=[] (empty), all actors receive 0.0 reward.
+        This is useful for non-trainable episodes.
         """
         # Reset
         for step in rollout.steps:
@@ -86,23 +87,19 @@ class Rubric:
             if inspect.iscoroutine(result):
                 result = await result
 
-            for role_id, reward in result.items():
-                rollout.rewards[role_id] = rollout.rewards.get(role_id, 0.0) + reward * weight
+            for actor_id, reward in result.items():
+                rollout.rewards[actor_id] = rollout.rewards.get(actor_id, 0.0) + reward * weight
 
             # Store metric
             func_name = getattr(func, "__name__", str(func))
             if result:
                 rollout.metrics[func_name] = next(iter(result.values()))
 
-        # Validate all roles are scored
-        for role_id in rollout.actors:
-            if role_id not in rollout.rewards:
-                raise ValueError(
-                    f"No reward function scored role '{role_id}'. "
-                    f"Actors in rollout: {rollout.actors}, "
-                    f"roles scored: {set(rollout.rewards.keys())}"
-                )
+        # Default unscored actors to 0.0
+        for actor_id in rollout.actors:
+            if actor_id not in rollout.rewards:
+                rollout.rewards[actor_id] = 0.0
 
         # Propagate to steps
         for step in rollout.steps:
-            step.reward = rollout.rewards[step.role_id]
+            step.reward = rollout.rewards[step.actor_id]

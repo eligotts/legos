@@ -20,24 +20,16 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     stream: bool = False
     logprobs: bool = False
-    top_logprobs: int | None = None
     return_token_ids: bool = False  # Return prompt_token_ids and token_ids
 
 
 # Chat completions response - logprobs
 
 
-class TopLogprob(BaseModel):
-    token: str
-    logprob: float
-    bytes: list[int] | None = None
-
-
 class TokenLogprob(BaseModel):
     token: str
     logprob: float
     bytes: list[int] | None = None
-    top_logprobs: list[TopLogprob] = []
 
 
 class ChoiceLogprobs(BaseModel):
@@ -71,29 +63,6 @@ class ChatCompletionResponse(BaseModel):
     prompt_token_ids: list[int] | None = None  # Prompt token IDs (unpadded)
 
 
-# Streaming
-
-
-class ChatCompletionChunkDelta(BaseModel):
-    role: Literal["assistant"] | None = None
-    content: str | None = None
-
-
-class ChatCompletionChunkChoice(BaseModel):
-    index: int
-    delta: ChatCompletionChunkDelta
-    finish_reason: Literal["stop", "length"] | None = None
-    logprobs: ChoiceLogprobs | None = None
-
-
-class ChatCompletionChunk(BaseModel):
-    id: str
-    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: list[ChatCompletionChunkChoice]
-
-
 # Models endpoint
 
 
@@ -115,9 +84,3 @@ class ModelListResponse(BaseModel):
 class LoadAdapterRequest(BaseModel):
     weights: str  # Base64-encoded safetensors bytes
     version: int | None = None  # Optional explicit version number
-
-
-class LoadAdapterResponse(BaseModel):
-    status: Literal["ok", "error"]
-    version: int
-    message: str | None = None

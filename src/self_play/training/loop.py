@@ -15,7 +15,7 @@ from typing import Dict, List
 
 from ..core.arena import Arena
 from ..core.types import TrainingBatch, TrainingRecord
-from .trainer import Trainer, compute_per_role_reward_stats
+from .trainer import Trainer, compute_per_actor_reward_stats
 from .batching import estimate_tokens, form_micro_batch
 
 
@@ -35,8 +35,8 @@ def compute_eval_metrics(batch: TrainingBatch) -> Dict[str, float]:
         "avg_advantage": sum(advantages) / len(advantages) if advantages else 0.0,
     }
 
-    # Add per-role reward breakdown
-    metrics.update(compute_per_role_reward_stats(batch.records))
+    # Add per-actor reward breakdown
+    metrics.update(compute_per_actor_reward_stats(batch.records))
 
     return metrics
 
@@ -46,7 +46,7 @@ async def training_loop(
     trainer: Trainer,
     batch_queue: asyncio.Queue,
     num_steps: int,
-    concurrency: int = 8,
+    episode_concurrency: int = 8,
     step_concurrency: int = 1,
     verbose: bool = False,
 ) -> None:
@@ -62,7 +62,7 @@ async def training_loop(
         trainer: Trainer instance for training
         batch_queue: asyncio.Queue for passing batches between generator and trainer
         num_steps: Number of training steps to run
-        concurrency: Max concurrent episodes during generation
+        episode_concurrency: Max concurrent episodes during generation
         step_concurrency: Max concurrent arena.step() calls
         verbose: Print debug info
     """
@@ -88,7 +88,7 @@ async def training_loop(
             # Launch new step tasks up to step_concurrency
             while len(pending) < step_concurrency and not shutdown.is_set():
                 task = asyncio.create_task(
-                    arena.step(concurrency=concurrency)
+                    arena.step(concurrency=episode_concurrency)
                 )
                 pending.add(task)
 
@@ -147,12 +147,12 @@ async def training_loop(
                 # Filter stale records immediately (trainer will also filter, but
                 # filtering here prevents buffering records that will be dropped)
                 current_version = trainer.train_step_idx
-                max_lag = trainer.config.max_policy_lag
+                staleness_limit = trainer.config.staleness_limit
 
                 fresh = []
                 for r in batch.records:
                     policy_version = r.meta.get("policy_version", 0)
-                    if current_version - policy_version <= max_lag:
+                    if current_version - policy_version <= staleness_limit:
                         fresh.append(r)
 
                 records_buffer.extend(fresh)
@@ -162,10 +162,10 @@ async def training_loop(
                     print(f"[trainer] dropped {stale_count} stale records")
 
                 # Form and process micro-batches as soon as we have enough tokens
-                micro_token_budget = trainer.config.micro_token_budget
-                while estimate_tokens(records_buffer) >= micro_token_budget:
+                micro_batch_tokens = trainer.config.micro_batch_tokens
+                while estimate_tokens(records_buffer) >= micro_batch_tokens:
                     micro_batch, records_buffer = form_micro_batch(
-                        records_buffer, micro_token_budget
+                        records_buffer, micro_batch_tokens
                     )
 
                     if verbose:
@@ -244,26 +244,26 @@ async def training_loop(
         wandb.finish()
 
 
-async def simple_training_loop(
+async def synchronous_training_loop(
     arena: Arena,
     trainer: Trainer,
     num_steps: int,
-    concurrency: int = 8,
+    episode_concurrency: int = 8,
     step_concurrency: int = 1,
     verbose: bool = False,
 ) -> None:
     """
-    Simple sequential training loop (no async overlap).
+    Simple sequential training loop with micro-batch streaming.
 
-    For simpler debugging or when generation is fast enough that
-    async overlap isn't needed. Also useful when running on a single
-    machine where overlapping generation and training would overload the GPU.
+    Generation and training don't overlap, but training uses the same
+    micro-batch streaming approach as training_loop - accumulating
+    gradients until min_samples_per_step is reached.
 
     Args:
         arena: Arena instance for generating rollouts
         trainer: Trainer instance for training
         num_steps: Number of training steps to run
-        concurrency: Max concurrent episodes during generation
+        episode_concurrency: Max concurrent episodes during generation
         step_concurrency: Number of arena.step() calls to run in parallel
         verbose: Print debug info
     """
@@ -279,101 +279,121 @@ async def simple_training_loop(
     records_buffer: List[TrainingRecord] = []
     consecutive_errors = 0
     max_consecutive_errors = 5
+    train_step = 0
 
-    for step in range(num_steps):
-        # Generate until we have enough records
-        while len(records_buffer) < trainer.config.batch_size:
-            # Launch step_concurrency arena.step() calls in parallel
-            tasks = [
-                asyncio.create_task(arena.step(concurrency=concurrency))
-                for _ in range(step_concurrency)
-            ]
+    async def generate_batch() -> List[TrainingRecord]:
+        """Generate one round of rollouts concurrently."""
+        nonlocal consecutive_errors
 
-            # Wait for ALL to complete
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [
+            asyncio.create_task(arena.step(concurrency=episode_concurrency))
+            for _ in range(step_concurrency)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Process results
-            round_records = 0
-            round_stale = 0
-            for result in results:
-                if isinstance(result, Exception):
-                    consecutive_errors += 1
-                    print(f"[step {step}] error ({consecutive_errors}/{max_consecutive_errors}): {result}")
-                    if consecutive_errors >= max_consecutive_errors:
-                        print(f"[step {step}] too many consecutive errors, aborting")
-                        return
-                    continue
+        fresh = []
+        for result in results:
+            if isinstance(result, Exception):
+                consecutive_errors += 1
+                print(f"[generate] error ({consecutive_errors}/{max_consecutive_errors}): {result}")
+                if consecutive_errors >= max_consecutive_errors:
+                    raise RuntimeError("Too many consecutive generation errors")
+                continue
 
-                consecutive_errors = 0  # Reset on success
-                batch = result
+            consecutive_errors = 0
+            if result.records:
+                fresh.extend(result.records)
 
-                if not batch.records:
-                    continue
+        return fresh
 
-                # Filter stale records
-                current_version = trainer.train_step_idx
-                max_lag = trainer.config.max_policy_lag
-
-                fresh = [
-                    r for r in batch.records
-                    if current_version - r.meta.get("policy_version", 0) <= max_lag
-                ]
-                records_buffer.extend(fresh)
-                round_records += len(fresh)
-                round_stale += len(batch.records) - len(fresh)
-
-            if verbose and round_records > 0:
-                print(f"[step {step}] generated {round_records + round_stale} records "
-                      f"({round_records} fresh, {round_stale} stale), "
+    while train_step < num_steps:
+        # Phase 1: Ensure buffer has at least one micro-batch worth of data
+        while estimate_tokens(records_buffer) < trainer.config.micro_batch_tokens:
+            new_records = await generate_batch()
+            records_buffer.extend(new_records)
+            if verbose:
+                print(f"[step {train_step}] generated {len(new_records)} records, "
                       f"buffer={len(records_buffer)}")
 
-        # Take batch_size records and train
-        train_records = records_buffer[:trainer.config.batch_size]
-        records_buffer = records_buffer[trainer.config.batch_size:]
+        # Phase 2: Process micro-batches until we step
+        stepped_this_iteration = False
+        while not stepped_this_iteration:
+            # Form and process micro-batches while we have enough tokens
+            while estimate_tokens(records_buffer) >= trainer.config.micro_batch_tokens:
+                micro_batch, records_buffer = form_micro_batch(
+                    records_buffer, trainer.config.micro_batch_tokens
+                )
 
-        train_batch = TrainingBatch(
-            records=train_records,
-            meta={},
-        )
+                if verbose:
+                    print(f"[step {train_step}] processing micro-batch: {len(micro_batch)} records, "
+                          f"{estimate_tokens(micro_batch)} tokens, "
+                          f"pending={trainer.pending_samples}")
 
-        metrics = await trainer.train_step(train_batch)
+                result = await trainer.accumulate(micro_batch)
 
-        # Log to wandb (reward stats already included in metrics from train_step)
-        if trainer.config.wandb_project:
-            import wandb
-            wandb.log(metrics, step=step + 1)
+                if result["stepped"]:
+                    stepped_this_iteration = True
+                    train_step += 1
+                    metrics = result["step_metrics"]
 
-        if verbose:
-            print(f"[step {step}] trained: loss={metrics.get('loss', 0):.4f}, "
-                  f"records={metrics.get('records', 0)}, "
-                  f"tokens={metrics.get('tokens', 0)}")
+                    # Log to wandb
+                    if trainer.config.wandb_project:
+                        import wandb
+                        wandb.log(metrics, step=train_step)
 
-        # Save checkpoint if it's time
-        if trainer.config.checkpoint_every > 0 and (step + 1) % trainer.config.checkpoint_every == 0:
-            checkpoint_path = trainer.save_checkpoint(step + 1)
-            if verbose and checkpoint_path:
-                print(f"[step {step}] saved checkpoint: {checkpoint_path}")
+                    if verbose:
+                        print(f"[step {train_step}] trained: loss={metrics.get('loss', 0):.4f}, "
+                              f"records={metrics.get('records', 0)}, "
+                              f"tokens={metrics.get('tokens', 0)}")
 
-        # Run evaluation periodically
-        if trainer.config.eval_every > 0 and (step + 1) % trainer.config.eval_every == 0:
+                    # Save checkpoint if it's time
+                    if trainer.config.checkpoint_every > 0 and train_step % trainer.config.checkpoint_every == 0:
+                        checkpoint_path = trainer.save_checkpoint(train_step)
+                        if verbose and checkpoint_path:
+                            print(f"[step {train_step}] saved checkpoint: {checkpoint_path}")
+
+                    # Run evaluation periodically
+                    if trainer.config.eval_every > 0 and train_step % trainer.config.eval_every == 0:
+                        if verbose:
+                            print(f"[step {train_step}] running evaluation...")
+                        eval_batch = await arena.step(
+                            concurrency=trainer.config.eval_concurrency,
+                        )
+                        eval_metrics = compute_eval_metrics(eval_batch)
+
+                        if trainer.config.wandb_project:
+                            import wandb
+                            prefixed = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                            wandb.log(prefixed, step=train_step)
+
+                        if verbose:
+                            print(f"[step {train_step}] eval: avg_reward={eval_metrics.get('avg_reward', 0):.4f}")
+
+                    break  # Exit micro-batch loop after step
+
+            if stepped_this_iteration:
+                break  # Exit to outer loop to check num_steps
+
+            # Buffer exhausted but didn't step - need more data
             if verbose:
-                print(f"[step {step}] running evaluation...")
+                print(f"[step {train_step}] buffer exhausted, pending={trainer.pending_samples}, "
+                      f"need {trainer.config.min_samples_per_step}, generating more...")
 
-            eval_batch = await arena.step(
-                concurrency=trainer.config.eval_concurrency,
-            )
-            eval_metrics = compute_eval_metrics(eval_batch)
-
-            if trainer.config.wandb_project:
-                import wandb
-                prefixed = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                wandb.log(prefixed, step=step + 1)
+            new_records = await generate_batch()
+            records_buffer.extend(new_records)
 
             if verbose:
-                print(f"[step {step}] eval: avg_reward={eval_metrics.get('avg_reward', 0):.4f}, "
-                      f"num_records={eval_metrics.get('num_records', 0)}")
+                print(f"[step {train_step}] generated {len(new_records)} records, "
+                      f"buffer={len(records_buffer)}")
 
     # Finish wandb run
     if trainer.config.wandb_project:
         import wandb
         wandb.finish()
+
+    if verbose:
+        print(f"[training] finished after {train_step} steps")
+        if records_buffer:
+            print(f"[training] {len(records_buffer)} records left in buffer")
+        if trainer.pending_samples > 0:
+            print(f"[training] {trainer.pending_samples} samples pending (not enough for full batch)")

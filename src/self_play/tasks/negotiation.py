@@ -5,7 +5,7 @@ This example demonstrates a faithful replication of SPIRAL's SimpleNegotiation e
 - Two players with opposite resource preferences
 - Structured actions: [Offer], [Accept], [Deny]
 - Winner determined by inventory value change
-- Uses RAECredit for role-conditioned advantage estimation
+- Uses RAECredit for actor-conditioned advantage estimation
 
 Game Structure:
 1. Both players start with 10 Wood + 10 Gold
@@ -240,13 +240,13 @@ class NegotiationEpisode(MultiTurnEpisode):
 
     def __init__(
         self,
-        player_0_role_id: str = "Player0",
-        player_1_role_id: str = "Player1",
+        player_0_actor_id: str = "Player0",
+        player_1_actor_id: str = "Player1",
         max_turns: int = 10,
     ):
         super().__init__(max_turns=max_turns)
-        self.player_0_role_id = player_0_role_id
-        self.player_1_role_id = player_1_role_id
+        self.player_0_actor_id = player_0_actor_id
+        self.player_1_actor_id = player_1_actor_id
         self._rubric = Rubric(funcs=[negotiation_reward])
 
     @property
@@ -259,24 +259,24 @@ class NegotiationEpisode(MultiTurnEpisode):
 
     def _get_opponent(self, player: str) -> str:
         """Get the opponent of the given player."""
-        if player == self.player_0_role_id:
-            return self.player_1_role_id
-        return self.player_0_role_id
+        if player == self.player_0_actor_id:
+            return self.player_1_actor_id
+        return self.player_0_actor_id
 
-    def startup(self, state: EpisodeState, artifact: Any) -> None:
+    def init_state(self, state: EpisodeState, artifact: Any) -> None:
         """Initialize the game state in state.data."""
         state.data["player_resources"] = {
-            self.player_0_role_id: copy.deepcopy(STARTING_RESOURCES),
-            self.player_1_role_id: copy.deepcopy(STARTING_RESOURCES),
+            self.player_0_actor_id: copy.deepcopy(STARTING_RESOURCES),
+            self.player_1_actor_id: copy.deepcopy(STARTING_RESOURCES),
         }
         state.data["player_values"] = {
-            self.player_0_role_id: PLAYER_VALUES["Player0"].copy(),
-            self.player_1_role_id: PLAYER_VALUES["Player1"].copy(),
+            self.player_0_actor_id: PLAYER_VALUES["Player0"].copy(),
+            self.player_1_actor_id: PLAYER_VALUES["Player1"].copy(),
         }
 
         # Calculate initial inventory values
         state.data["initial_values"] = {}
-        for player in [self.player_0_role_id, self.player_1_role_id]:
+        for player in [self.player_0_actor_id, self.player_1_actor_id]:
             state.data["initial_values"][player] = calculate_inventory_value(
                 state.data["player_resources"][player],
                 state.data["player_values"][player]
@@ -299,8 +299,8 @@ class NegotiationEpisode(MultiTurnEpisode):
 
     def _build_initial_state(self, state: EpisodeState) -> str:
         """Build the initial game state announcement (shared, no player-specific values)."""
-        p0 = self.player_0_role_id
-        p1 = self.player_1_role_id
+        p0 = self.player_0_actor_id
+        p1 = self.player_1_actor_id
         resources = state.data["player_resources"]
 
         return f"""=== NEGOTIATION GAME ===
@@ -364,7 +364,7 @@ Opponent's resources: {self._format_resources(opp_resources)}"""
         start_idx = random.randint(0, 1)
         state.data["start_idx"] = start_idx
 
-        return self.player_0_role_id if start_idx == 0 else self.player_1_role_id
+        return self.player_0_actor_id if start_idx == 0 else self.player_1_actor_id
 
     def get_initial_prompt(
         self,
@@ -403,7 +403,7 @@ Opponent's resources: {self._format_resources(opp_resources)}"""
         if not last_step:
             return ""
 
-        current_player = last_step.role_id
+        current_player = last_step.actor_id
         opponent = self._get_opponent(current_player)
         action_text = last_step.completion_text
 
@@ -516,8 +516,8 @@ Opponent's resources: {self._format_resources(opp_resources)}"""
     ) -> str:
         """Format action result for the shared transcript."""
         resources = state.data["player_resources"]
-        p0 = self.player_0_role_id
-        p1 = self.player_1_role_id
+        p0 = self.player_0_actor_id
+        p1 = self.player_1_actor_id
 
         # Action-specific result
         if action_type == "accept":
@@ -551,21 +551,21 @@ Opponent's resources: {self._format_resources(opp_resources)}"""
 
         # Compute value changes for each player
         value_changes = {}
-        for player in [self.player_0_role_id, self.player_1_role_id]:
+        for player in [self.player_0_actor_id, self.player_1_actor_id]:
             if player in player_resources and player in player_values and player in initial_values:
                 final_value = calculate_inventory_value(player_resources[player], player_values[player])
                 value_changes[player] = final_value - initial_values[player]
 
         # Determine winner
         if invalid_action:
-            winner = self.player_1_role_id if invalid_action == self.player_0_role_id else self.player_0_role_id
+            winner = self.player_1_actor_id if invalid_action == self.player_0_actor_id else self.player_0_actor_id
         elif value_changes:
-            p0_change = value_changes.get(self.player_0_role_id, 0)
-            p1_change = value_changes.get(self.player_1_role_id, 0)
+            p0_change = value_changes.get(self.player_0_actor_id, 0)
+            p1_change = value_changes.get(self.player_1_actor_id, 0)
             if p0_change > p1_change:
-                winner = self.player_0_role_id
+                winner = self.player_0_actor_id
             elif p1_change > p0_change:
-                winner = self.player_1_role_id
+                winner = self.player_1_actor_id
             else:
                 winner = "Draw"
         else:
@@ -594,24 +594,24 @@ class NegotiationArena(Arena):
     def __init__(
         self,
         client: InferenceClient,
-        batch_size: int = 4,
+        episodes_per_step: int = 4,
         verbose: bool = False,
         credit_assigner: CreditAssigner | None = None,
     ):
-        # Use RAECredit by default for role-conditioned baselines
+        # Use RAECredit by default for actor-conditioned baselines
         super().__init__(
             client,
             credit_assigner=credit_assigner or RAECredit(decay=0.95),
             verbose=verbose
         )
-        self.batch_size = batch_size
+        self.episodes_per_step = episodes_per_step
 
     def get_batch(self) -> List[EpisodeRequest]:
-        """Generate batch_size negotiation episodes."""
+        """Generate episodes_per_step negotiation episodes."""
         return [
             EpisodeRequest(
                 episode_type="negotiation",
                 artifact={},  # No artifact needed - game is self-contained
             )
-            for _ in range(self.batch_size)
+            for _ in range(self.episodes_per_step)
         ]

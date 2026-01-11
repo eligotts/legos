@@ -11,22 +11,22 @@ the core patterns of modern RL training:
 - Online weight updates to inference server (LoRA hot-swap)
 
 Example usage:
-    from self_play.core import Arena, OpenAIClient
-    from self_play.training import Trainer, TrainerConfig, WeightPublisher, training_loop
+    from self_play.core import OpenAIClient
+    from self_play.tasks import GSM8KArena
+    from self_play.training import Trainer, TrainerConfig, training_loop
 
     # Setup arena
-    client = OpenAIClient.for_local(port=8000)
-    arena = DebateArena(client=client, ...)
+    client = OpenAIClient(base_url="http://localhost:8000/v1")
+    arena = GSM8KArena(client=client, episodes_per_step=8)
 
     # Setup trainer
     model, tokenizer = load_model_with_lora(...)
     optimizer = mx.optimizers.Adam(learning_rate=1e-5)
     config = TrainerConfig(
-        micro_token_budget=4096,
-        max_policy_lag=3,
+        micro_batch_tokens=4096,
+        staleness_limit=3,
     )
-    publisher = WeightPublisher(base_url="http://localhost:8000")
-    trainer = Trainer(model, optimizer, config, publisher)
+    trainer = Trainer(model, optimizer, config, client)
 
     # Run training
     batch_queue = asyncio.Queue(maxsize=4)
@@ -35,8 +35,7 @@ Example usage:
 
 from .config import TrainerConfig
 from .trainer import Trainer
-from .weight_publisher import WeightPublisher
-from .loop import training_loop, simple_training_loop
+from .loop import training_loop, synchronous_training_loop
 from .batching import split_by_token_budget, collate, estimate_tokens, form_micro_batch
 from .loss import compute_loss, get_per_token_logps, make_loss_fn
 
@@ -44,10 +43,9 @@ __all__ = [
     # Core classes
     "TrainerConfig",
     "Trainer",
-    "WeightPublisher",
     # Training loops
     "training_loop",
-    "simple_training_loop",
+    "synchronous_training_loop",
     # Utilities
     "split_by_token_budget",
     "collate",

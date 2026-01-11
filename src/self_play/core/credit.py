@@ -14,6 +14,20 @@ of the hierarchy form a group for advantage computation:
 - Children: Within each parent, its children form independent groups
 - This recurses down the tree
 
+Grouping by Episode Type:
+-------------------------
+Within each hierarchy level, rollouts are further grouped by their episode_type.
+This ensures that different task types (e.g., "gsm8k" vs "negotiation") are not
+compared against each other when computing relative advantages.
+
+Per-Actor Advantage Computation:
+-------------------------------
+Each rollout can have multiple actors (stored in rollout.rewards as a dict mapping
+actor_id -> reward). Advantages are computed independently for each actor across the
+group. Each step in a rollout is assigned the advantage corresponding to its
+step.actor_id, enabling multi-agent scenarios where different actors within the same
+episode receive actor-appropriate credit.
+
 For GRPO, advantage = reward - mean(group_rewards), so rollouts are compared
 against peers at their hierarchy level.
 """
@@ -88,17 +102,17 @@ def apply_credit(
 # GRPO Credit Assignment
 # ---------------------------------------------------------------------------
 
-def _get_role_keys(rollouts: List[Rollout]) -> set:
+def _get_actor_keys(rollouts: List[Rollout]) -> set:
     """
-    Get the set of role keys from rollouts, validating consistency.
+    Get the set of actor keys from rollouts, validating consistency.
 
-    All rollouts must have the same set of role keys in their rewards dict.
-    Raises ValueError if rollouts have inconsistent role keys.
+    All rollouts must have the same set of actor keys in their rewards dict.
+    Raises ValueError if rollouts have inconsistent actor keys.
     """
     if not rollouts:
         return set()
 
-    # Get role keys from first rollout
+    # Get actor keys from first rollout
     first_keys = set(rollouts[0].rewards.keys())
 
     # Validate all rollouts have same keys
@@ -106,7 +120,7 @@ def _get_role_keys(rollouts: List[Rollout]) -> set:
         keys = set(rollout.rewards.keys())
         if keys != first_keys:
             raise ValueError(
-                f"Inconsistent role keys at hierarchy level. "
+                f"Inconsistent actor keys at hierarchy level. "
                 f"Rollout 0 has {first_keys}, rollout {i} has {keys}"
             )
 
@@ -147,9 +161,9 @@ class GRPOCredit(CreditAssigner):
     Computes advantages as: A_i = R_i - mean(R_1, ..., R_N)
     where the group consists of rollouts at the same hierarchy level.
 
-    Advantages are computed per-role: if rollouts have multiple roles in their
-    rewards dict, each role's advantage is computed independently across the group.
-    Each step receives the advantage for its role_id.
+    Advantages are computed per-actor: if rollouts have multiple actors in their
+    rewards dict, each actor's advantage is computed independently across the group.
+    Each step receives the advantage for its actor_id.
 
     Args:
         normalize: If True, normalize advantages to zero mean, unit std within group
@@ -196,33 +210,33 @@ class GRPOCredit(CreditAssigner):
         for group_results in groups.values():
             rollouts = [r.rollout for r in group_results]
 
-            # Get role keys (validates consistency across rollouts)
-            role_keys = _get_role_keys(rollouts)
+            # Get actor keys (validates consistency across rollouts)
+            actor_keys = _get_actor_keys(rollouts)
 
-            if not role_keys:
+            if not actor_keys:
                 # No rewards set - assign 0 to all steps
                 for result in group_results:
                     rollout = result.rollout
                     for i, _ in enumerate(rollout.steps):
                         weights[(rollout.id, i)] = 0.0
             else:
-                # Compute advantages per role
-                role_advantages: Dict[str, List[float]] = {}
-                for role_id in role_keys:
-                    rewards = [r.rewards.get(role_id, 0.0) for r in rollouts]
-                    role_advantages[role_id] = _compute_grpo_advantages(
+                # Compute advantages per actor
+                actor_advantages: Dict[str, List[float]] = {}
+                for actor_id in actor_keys:
+                    rewards = [r.rewards.get(actor_id, 0.0) for r in rollouts]
+                    actor_advantages[actor_id] = _compute_grpo_advantages(
                         rewards, self.normalize, self.positive_only
                     )
 
-                # Assign advantage to each step based on step's role_id
+                # Assign advantage to each step based on step's actor_id
                 for idx, result in enumerate(group_results):
                     rollout = result.rollout
                     for i, step in enumerate(rollout.steps):
-                        # Get advantage for this step's role
-                        if step.role_id in role_advantages:
-                            adv = role_advantages[step.role_id][idx]
+                        # Get advantage for this step's actor
+                        if step.actor_id in actor_advantages:
+                            adv = actor_advantages[step.actor_id][idx]
                         else:
-                            # Step's role not in rewards dict - use 0
+                            # Step's actor not in rewards dict - use 0
                             adv = 0.0
                         weights[(rollout.id, i)] = adv
 
@@ -276,7 +290,7 @@ class EpisodicRewardCredit(CreditAssigner):
     """
     Episode-level reward as credit (no relative advantage computation).
 
-    Each step gets the reward for its role from the rollout's rewards dict.
+    Each step gets the reward for its actor from the rollout's rewards dict.
     Useful for simpler REINFORCE without group normalization.
     """
 
@@ -301,15 +315,15 @@ class EpisodicRewardCredit(CreditAssigner):
             rollout = result.rollout
 
             for i, step in enumerate(rollout.steps):
-                # Get reward for this step's role
-                reward = rollout.rewards.get(step.role_id, 0.0)
+                # Get reward for this step's actor
+                reward = rollout.rewards.get(step.actor_id, 0.0)
                 weights[(rollout.id, i)] = reward
 
             self._assign_all(result.children, weights)
 
 
 # ---------------------------------------------------------------------------
-# Role-conditioned Advantage Estimation (RAE) from SPIRAL
+# Actor-conditioned Advantage Estimation (RAE) from SPIRAL
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -331,14 +345,14 @@ class EMA:
 @dataclass
 class RAECredit(CreditAssigner):
     """
-    Role-conditioned Advantage Estimation from the SPIRAL paper.
+    Actor-conditioned Advantage Estimation from the SPIRAL paper.
 
-    Maintains per-(episode_type, role_id) EMA baselines across the training run.
+    Maintains per-(episode_type, actor_id) EMA baselines across the training run.
     Advantage = reward - baseline, where baseline is computed BEFORE updating
     with the new batch's rewards (unbiased estimation).
 
     This addresses variance in self-play with shared policies where different
-    roles may have structural advantages (e.g., first-move advantage).
+    actors may have structural advantages (e.g., first-move advantage).
 
     Args:
         decay: EMA decay factor. Higher values = slower baseline adaptation.
@@ -346,8 +360,8 @@ class RAECredit(CreditAssigner):
     """
     decay: float = 0.95
 
-    # State: baselines[episode_type][role_id] = EMA
-    # Initialized lazily on first observation of each (episode_type, role_id)
+    # State: baselines[episode_type][actor_id] = EMA
+    # Initialized lazily on first observation of each (episode_type, actor_id)
     _baselines: Dict[str, Dict[str, EMA]] = field(default_factory=dict)
 
     def compute(
@@ -357,7 +371,7 @@ class RAECredit(CreditAssigner):
         """
         Compute RAE advantages for all rollouts in the hierarchy.
 
-        For each (episode_type, role_id):
+        For each (episode_type, actor_id):
         1. Get baseline from previous batches
         2. Compute advantages = reward - baseline for each rollout
         3. Update baseline with batch-mean reward
@@ -392,10 +406,10 @@ class RAECredit(CreditAssigner):
 
             rollouts = [r.rollout for r in group_results]
 
-            # Get role keys (validates consistency across rollouts)
-            role_keys = _get_role_keys(rollouts)
+            # Get actor keys (validates consistency across rollouts)
+            actor_keys = _get_actor_keys(rollouts)
 
-            if not role_keys:
+            if not actor_keys:
                 # No rewards set - assign 0 to all steps
                 for result in group_results:
                     rollout = result.rollout
@@ -403,40 +417,40 @@ class RAECredit(CreditAssigner):
                         weights[(rollout.id, i)] = 0.0
                 continue
 
-            # Compute mean reward per role across this batch (for batch-wise EMA update)
-            role_mean_rewards: Dict[str, float] = {}
-            for role_id in role_keys:
-                rewards = [r.rewards.get(role_id, 0.0) for r in rollouts]
-                role_mean_rewards[role_id] = sum(rewards) / len(rewards)
+            # Compute mean reward per actor across this batch (for batch-wise EMA update)
+            actor_mean_rewards: Dict[str, float] = {}
+            for actor_id in actor_keys:
+                rewards = [r.rewards.get(actor_id, 0.0) for r in rollouts]
+                actor_mean_rewards[actor_id] = sum(rewards) / len(rewards)
 
-            # Compute advantages per role
-            role_advantages: Dict[str, List[float]] = {}
-            for role_id in role_keys:
-                # Ensure baseline exists for this role
-                if role_id not in self._baselines[episode_type]:
-                    self._baselines[episode_type][role_id] = EMA(decay=self.decay)
+            # Compute advantages per actor
+            actor_advantages: Dict[str, List[float]] = {}
+            for actor_id in actor_keys:
+                # Ensure baseline exists for this actor
+                if actor_id not in self._baselines[episode_type]:
+                    self._baselines[episode_type][actor_id] = EMA(decay=self.decay)
 
                 # Get baseline BEFORE updating (unbiased advantage estimation)
-                baseline = self._baselines[episode_type][role_id].get()
+                baseline = self._baselines[episode_type][actor_id].get()
 
                 # Compute advantage for each rollout
                 advantages = []
                 for rollout in rollouts:
-                    reward = rollout.rewards.get(role_id, 0.0)
+                    reward = rollout.rewards.get(actor_id, 0.0)
                     advantages.append(reward - baseline)
-                role_advantages[role_id] = advantages
+                actor_advantages[actor_id] = advantages
 
                 # Update baseline with batch mean
-                self._baselines[episode_type][role_id].update(role_mean_rewards[role_id])
+                self._baselines[episode_type][actor_id].update(actor_mean_rewards[actor_id])
 
-            # Assign advantage to each step based on step's role_id
+            # Assign advantage to each step based on step's actor_id
             for idx, result in enumerate(group_results):
                 rollout = result.rollout
                 for i, step in enumerate(rollout.steps):
-                    if step.role_id in role_advantages:
-                        adv = role_advantages[step.role_id][idx]
+                    if step.actor_id in actor_advantages:
+                        adv = actor_advantages[step.actor_id][idx]
                     else:
-                        # Step's role not in rewards dict - use 0
+                        # Step's actor not in rewards dict - use 0
                         adv = 0.0
                     weights[(rollout.id, i)] = adv
 

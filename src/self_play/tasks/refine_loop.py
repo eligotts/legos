@@ -4,7 +4,7 @@ RefineLoop: Generator-Critic iterative refinement.
 Pattern: Generator produces draft → Critic provides feedback → Generator revises → repeat N times.
 
 This demonstrates:
-- Cooperative multi-role training (both roles share same reward)
+- Cooperative multi-actor training (both actors share same reward)
 - Iterative refinement loop with state tracking
 - LLM judge for final quality assessment
 - Dynamic task generation via TaskProposerEpisode
@@ -40,6 +40,7 @@ from ..core import (
     GRPOCredit,
     CreditAssigner,
     Messages,
+    GenerateResult,
 )
 
 
@@ -102,7 +103,7 @@ Respond with ONLY a JSON object: {{"score": <0-10>, "reason": "<very very brief 
     if arena.verbose:
         print(f"    [refine_loop] final_quality={score:.2f} iterations={extras.get('num_iterations', 0)}")
 
-    # Both roles get same reward (cooperative)
+    # Both actors get same reward (cooperative)
     return {actor: score for actor in actors}
 
 
@@ -119,13 +120,13 @@ class RefineLoopEpisode(MultiTurnEpisode):
 
     def __init__(
         self,
-        generator_role: str = "Generator",
-        critic_role: str = "Critic",
+        generator_actor: str = "Generator",
+        critic_actor: str = "Critic",
         num_iterations: int = 2,
     ):
         super().__init__(max_turns=num_iterations * 2)
-        self.generator_role = generator_role
-        self.critic_role = critic_role
+        self.generator_actor = generator_actor
+        self.critic_actor = critic_actor
         self.num_iterations = num_iterations
         self._rubric = Rubric(funcs=[refine_loop_reward])
 
@@ -137,12 +138,12 @@ class RefineLoopEpisode(MultiTurnEpisode):
     def rubric(self) -> Rubric:
         return self._rubric
 
-    def startup(self, state: EpisodeState, artifact: Any) -> None:
+    def init_state(self, state: EpisodeState, artifact: Any) -> None:
         state.data["drafts"] = []
         state.data["feedback"] = []
 
     def get_initial_actor(self, artifact: Any, state: EpisodeState) -> str:
-        return self.generator_role
+        return self.generator_actor
 
     def get_initial_prompt(self, arena: Arena, artifact: Any, state: EpisodeState) -> str:
         return f"""Task: {artifact.get('task', '')}
@@ -153,13 +154,13 @@ Requirements:
 Write your first draft."""
 
     def get_next_actor(self, state: EpisodeState, artifact: Any) -> str:
-        if state.current_actor == self.generator_role:
-            return self.critic_role
-        return self.generator_role
+        if state.current_actor == self.generator_actor:
+            return self.critic_actor
+        return self.generator_actor
 
     def get_observation(self, state: EpisodeState, arena: Arena, artifact: Any) -> str:
-        """Provide role-specific context."""
-        if state.current_actor == self.critic_role:
+        """Provide actor-specific context."""
+        if state.current_actor == self.critic_actor:
             # Critic sees the latest draft
             draft = state.data["drafts"][-1] if state.data["drafts"] else ""
             iteration = len(state.data["drafts"])
@@ -193,7 +194,7 @@ IT IS CRUCIAL THAT YOU ONLY OUTPUT YOUR REVISED DRAFT BASED ON THE FEEDBACK. DO 
 
         completion = last_step.completion_text
 
-        if last_step.role_id == self.generator_role:
+        if last_step.actor_id == self.generator_actor:
             state.data["drafts"].append(completion)
             draft_num = len(state.data["drafts"])
 
@@ -219,12 +220,6 @@ IT IS CRUCIAL THAT YOU ONLY OUTPUT YOUR REVISED DRAFT BASED ON THE FEEDBACK. DO 
         }
 
 
-async def task_proposer_reward(rollout: Rollout, arena: Arena) -> Dict[str, float]:
-    """Empty reward function - proposer episodes are not trained."""
-    # Must return a score for all actors, even though this episode is non-trainable
-    return {actor: 0.0 for actor in rollout.actors}
-
-
 class TaskProposerEpisode(Episode):
     """
     Non-trainable episode that generates new tasks for the arena.
@@ -238,9 +233,9 @@ class TaskProposerEpisode(Episode):
     }
     """
 
-    def __init__(self, proposer_role: str = "TaskProposer"):
-        self.proposer_role = proposer_role
-        self._rubric = Rubric(funcs=[task_proposer_reward])
+    def __init__(self, proposer_actor: str = "TaskProposer"):
+        self.proposer_actor = proposer_actor
+        self._rubric = Rubric(funcs=[])  # Non-trainable, defaults to 0 reward
 
     @property
     def episode_type(self) -> str:
@@ -263,26 +258,12 @@ class TaskProposerEpisode(Episode):
         examples = artifact.get("examples", [])
         prompt = self._build_prompt(arena, examples)
 
-        # Generate new task via OpenRouter (non-trainable, so no token IDs needed)
-        # response = await _openrouter_client.chat.completions.create(
-        #     model="google/gemini-2.0-flash-001",
-        #     messages=prompt,
-        #     temperature=0.9,
-        #     max_tokens=300,
-        # )
-        # response_text = response.choices[0].message.content
-
         # Generate new task via arena.call_model
-        response = await self.call_model(self.proposer_role, prompt, arena)
+        response = await self.call_model(self.proposer_actor, prompt, arena)
 
         step = Step(
-            role_id=self.proposer_role,
+            actor_id=self.proposer_actor,
             prompt=prompt,
-            # completion=[{"role": "assistant", "content": response_text}],
-            # # No token IDs since this is non-trainable
-            # prompt_token_ids=None,
-            # completion_token_ids=None,
-            # completion_logprobs=None,
             completion=response.completion,
             prompt_token_ids=response.prompt_token_ids,
             completion_token_ids=response.completion_token_ids,
@@ -304,9 +285,7 @@ class TaskProposerEpisode(Episode):
         artifact: Any,
         meta: Optional[Dict[str, Any]] = None,
         is_trainable: bool = True,
-    ) -> "GenerateResult":
-        from ..core import GenerateResult
-
+    ) -> GenerateResult:
         result = await super().generate(arena, artifact, meta=meta, is_trainable=is_trainable)
 
         # Store generated task in tasks store
@@ -324,7 +303,7 @@ class TaskProposerEpisode(Episode):
         return result
 
     def _build_prompt(self, arena: Arena, examples: List[Dict]) -> Messages:
-        role = arena.roles.get(self.proposer_role)
+        actor = arena.actors.get(self.proposer_actor)
 
         examples_text = ""
         if examples:
@@ -345,8 +324,8 @@ Respond with ONLY a JSON object:
 Do NOT use markdown code blocks. Output ONLY the JSON object."""
 
         messages: Messages = []
-        if role and role.system_prompt:
-            messages.append({"role": "system", "content": role.system_prompt})
+        if actor and actor.system_prompt:
+            messages.append({"role": "system", "content": actor.system_prompt})
         messages.append({"role": "user", "content": user_content})
 
         return messages
@@ -373,8 +352,8 @@ class RefineLoopArena(Arena):
     def __init__(
         self,
         client: InferenceClient,
-        batch_size: int = 4,
-        proposer_batch_size: int = 1,
+        episodes_per_step: int = 4,
+        proposer_episodes_per_step: int = 1,
         verbose: bool = False,
         credit_assigner: CreditAssigner | None = None,
     ):
@@ -383,8 +362,8 @@ class RefineLoopArena(Arena):
             credit_assigner=credit_assigner or GRPOCredit(),
             verbose=verbose,
         )
-        self.batch_size = batch_size
-        self.proposer_batch_size = proposer_batch_size
+        self.episodes_per_step = episodes_per_step
+        self.proposer_episodes_per_step = proposer_episodes_per_step
 
     def get_batch(self) -> List[EpisodeRequest]:
         """Sample tasks from store and include proposer requests."""
@@ -393,7 +372,7 @@ class RefineLoopArena(Arena):
             return []
 
         # Sample tasks for refinement
-        tasks = store.sample(k=self.batch_size)
+        tasks = store.sample(k=self.episodes_per_step)
         refine_requests = [
             EpisodeRequest(episode_type="refine_loop", artifact=task.data)
             for task in tasks
@@ -401,7 +380,7 @@ class RefineLoopArena(Arena):
 
         # Add proposer requests (non-trainable) to generate new tasks
         proposer_requests = []
-        for _ in range(self.proposer_batch_size):
+        for _ in range(self.proposer_episodes_per_step):
             examples = store.sample(k=min(3, store.count()))
             proposer_requests.append(EpisodeRequest(
                 episode_type="task_propose",

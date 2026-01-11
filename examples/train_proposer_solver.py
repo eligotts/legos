@@ -1,84 +1,113 @@
 """
-Example: Training a proposer/solver agent with RL.
-
-This script demonstrates how to use the self-play training module to train
-proposer and solver agents. It combines:
-- The ProposerSolverArena from the examples module (for generation)
-- The Trainer from the training module (for training)
-- An mlx-vllm server for inference (with LoRA hot-swap)
+ProposerSolver: Train proposer/solver agents with RL.
 
 The proposer learns to generate questions at an optimal difficulty level,
 while the solver learns to answer them correctly.
+More of a toy example just to show how this proposer/solver paradigm works, we
+obviously don't want the proposer model to just generate the question AND the answer,
+would rather an external validator like deterministic execution of code to get the 'answer'
 
-To run this example:
-1. Start mlx-vllm server with LoRA enabled:
-   MLX_VLLM_LORA_RANK=8 MLX_VLLM_LORA_LAYERS=16 \
-   python -m uvicorn mlx_vllm.server:app --port 8000
+Inspired by general structure from Absolute Zero paper (arXiv:2505.03335).
 
-2. Run this script:
-   python examples/train_proposer_solver.py
+To run:
+1. Configure LoRA parameters in src/self_play/lora.py
+
+2. Start inference server:
+   self-play serve --model /path/to/model
+
+3. Run training:
+   uv run examples/train_proposer_solver.py
 """
 import asyncio
 import argparse
 
-import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten
 from mlx_lm import load
-from mlx_lm.tuner.utils import linear_to_lora_layers
 
-from self_play.core import OpenAIClient, Role, Artifact
+from self_play.core import OpenAIClient, Actor, Artifact
+from self_play.lora import apply_lora, print_trainable_params
 from self_play.tasks.proposer_solver import ProposerSolverArena, ProposerEpisode, SolveEpisode
 from self_play.training import (
     Trainer,
     TrainerConfig,
-    WeightPublisher,
     training_loop,
-    simple_training_loop,
+    synchronous_training_loop,
 )
 
 
-def load_model_with_lora(
-    model_path: str,
-    lora_rank: int = 16,
-    lora_layers: int = 16,
-    lora_scale: float = 32.0,
-    lora_dropout: float = 0.05,
-):
-    """
-    Load model and attach LoRA adapters.
+# =============================================================================
+# CONFIGURATION - Edit these values directly
+# =============================================================================
 
-    Args:
-        model_path: Path to the base model
-        lora_rank: LoRA rank (must match server config)
-        lora_layers: Number of layers to apply LoRA to
-        lora_scale: LoRA scaling factor (lora_alpha in PEFT)
-        lora_dropout: LoRA dropout
+# Model
+MODEL_PATH = "mlx_model"
 
-    Returns:
-        Tuple of (model, tokenizer)
-    """
+# Inference server
+INFERENCE_URL = "http://localhost:8000"
+
+# Task settings
+N_SOLVER_ROLLOUTS = 4  # Monte Carlo solver attempts per proposed question 
+
+# Generation (per arena.step())
+EPISODES_PER_STEP = 4     # Episodes per arena.step()
+EPISODE_CONCURRENCY = 4   # Max concurrent episodes
+STEP_CONCURRENCY = 1      # Max concurrent arena.step() calls
+
+# Training
+NUM_STEPS = 100
+LR = 1e-5
+MIN_SAMPLES_PER_STEP = 32  # Records needed before optimizer step
+MICRO_BATCH_TOKENS = 2048  # Max tokens per micro-batch
+STALENESS_LIMIT = 2        # Discard records older than N steps
+
+# KL regularization
+KL_COEF = 0.1
+USE_KL_PENALTY = False
+
+# Generation parameters
+MAX_TOKENS = 512
+
+# Training mode
+USE_SIMPLE_LOOP = False  # True for sequential, False for async
+
+# Logging
+WANDB_PROJECT = None  # Set to enable W&B logging
+WANDB_RUN_NAME = None
+
+# =============================================================================
+
+
+PROPOSER_SYSTEM_PROMPT = """You are a creative math problem creator.
+Generate interesting, well-formed problems with clear answers.
+Ensure that in your question you explicitly state the form the answer should be provided in."""
+
+SOLVER_SYSTEM_PROMPT = """You are a skilled math problem solver.
+Think step by step and provide clear, correct answers.
+Ensure that your answer is provided in the form specified in the question."""
+
+
+# Seed questions for the proposer to learn from
+INITIAL_QUESTIONS = [
+    {"question": "What is 15 + 27? Answer as a number.", "ground_truth": "42"},
+    {"question": "If x + 5 = 12, what is x? Answer as just the number.", "ground_truth": "7"},
+    {"question": "What is 8 * 5? Answer as a number.", "ground_truth": "40"},
+    {"question": "What is 144 / 12? Answer as a number.", "ground_truth": "12"},
+    {"question": "What is 2^8? Answer as a number.", "ground_truth": "256"},
+    {"question": "If 3x = 21, what is x? Answer as just the number.", "ground_truth": "7"},
+    {"question": "What is the sum of 13, 17, and 22? Answer as a number.", "ground_truth": "52"},
+    {"question": "What is 7! / 6!? Answer as a number.", "ground_truth": "7"},
+    {"question": "If a rectangle has length 8 and width 5, what is its area? Answer as a number.", "ground_truth": "40"},
+    {"question": "What is the square root of 169? Answer as a number.", "ground_truth": "13"},
+]
+
+
+def load_model_with_lora(model_path: str):
+    """Load model and attach LoRA adapters."""
     print(f"Loading model from {model_path}...")
     model, tokenizer = load(model_path)
 
-    # Defaults match official LiquidAI/PEFT recommendations
-    lora_keys = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"}
-
-    print(f"Attaching LoRA (rank={lora_rank}, layers={lora_layers}, keys={lora_keys})...")
-    lora_config = {
-        "rank": lora_rank,
-        "scale": lora_scale,
-        "dropout": lora_dropout,
-        "keys": lora_keys,
-    }
-    linear_to_lora_layers(model, lora_layers, lora_config)
-
-    # Count trainable parameters
-    trainable_params = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
-    total_params = sum(p.size for _, p in tree_flatten(model.parameters()))
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
-          f"({100 * trainable_params / total_params:.2f}%)")
+    apply_lora(model, inference_mode=False)
+    print_trainable_params(model)
 
     return model, tokenizer
 
@@ -96,7 +125,6 @@ async def preview_proposer_solver(arena, concurrency: int = 4):
         print("No records generated.")
         return
 
-    # Group by rollout
     episodes = {}
     for r in batch.records:
         if r.rollout_id not in episodes:
@@ -105,18 +133,16 @@ async def preview_proposer_solver(arena, concurrency: int = 4):
 
     print(f"Episodes: {len(episodes)} | Records: {len(batch.records)}\n")
 
-    # Track stats by episode type
     propose_stats = {"rewards": [], "solve_rates": []}
     solve_stats = {"correct": 0, "total": 0, "rewards": []}
 
-    for i, (rid, data) in enumerate(episodes.items(), 1):
+    for i, (_, data) in enumerate(episodes.items(), 1):
         meta = data["meta"]
         episode_type = meta.get("episode_type", "?")
         extras = meta.get("extras", {})
         artifact = meta.get("artifact", {}) or {}
 
         if episode_type == "propose":
-            # Proposer episode
             question = extras.get("question", artifact.get("question", "N/A"))
             ground_truth = extras.get("ground_truth", artifact.get("ground_truth", "N/A"))
             solve_rate = extras.get("solve_rate", 0)
@@ -129,14 +155,12 @@ async def preview_proposer_solver(arena, concurrency: int = 4):
             print(f"    Q: {truncate(question, 80)}")
             print(f"    Answer: {ground_truth}")
 
-            # Show solver attempts if available
             solver_results = extras.get("solver_results", [])
             if solver_results:
                 correct = sum(1 for r in solver_results if r.get("correct"))
                 print(f"    Solver attempts: {correct}/{len(solver_results)} correct")
 
         elif episode_type == "solve":
-            # Solver episode
             question = artifact.get("question", "N/A")
             ground_truth = artifact.get("ground_truth", "N/A")
             response = extras.get("response", "N/A")
@@ -157,7 +181,6 @@ async def preview_proposer_solver(arena, concurrency: int = 4):
 
         print()
 
-    # Summary stats
     print("Summary:")
     if propose_stats["rewards"]:
         avg_reward = sum(propose_stats["rewards"]) / len(propose_stats["rewards"])
@@ -171,146 +194,105 @@ async def preview_proposer_solver(arena, concurrency: int = 4):
 
 
 async def main(args):
-    # Seed questions for the proposer to learn from
-    initial_questions = [
-        {"question": "What is 15 + 27? Answer as a number.", "ground_truth": "42"},
-        {"question": "If x + 5 = 12, what is x? Answer as just the number.", "ground_truth": "7"},
-        {"question": "What is 8 * 5? Answer as a number.", "ground_truth": "40"},
-        {"question": "What is 144 / 12? Answer as a number.", "ground_truth": "12"},
-        {"question": "What is 2^8? Answer as a number.", "ground_truth": "256"},
-        {"question": "If 3x = 21, what is x? Answer as just the number.", "ground_truth": "7"},
-        {"question": "What is the sum of 13, 17, and 22? Answer as a number.", "ground_truth": "52"},
-        {"question": "What is 7! / 6!? Answer as a number.", "ground_truth": "7"},
-        {"question": "If a rectangle has length 8 and width 5, what is its area? Answer as a number.", "ground_truth": "40"},
-        {"question": "What is the square root of 169? Answer as a number.", "ground_truth": "13"},
-    ]
-
-    # Setup inference server URL
-    base_url = args.url if args.url else f"http://{args.host}:{args.port}"
-    print(f"\nConnecting to inference server at {base_url}...")
-
-    # Setup inference client
-    if args.url:
-        client = OpenAIClient(
-            api_key="not-needed",
-            model="local",
-            base_url=f"{base_url.rstrip('/')}/v1",
-            timeout=120.0,
-        )
-    else:
-        client = OpenAIClient.for_local(host=args.host, port=args.port, timeout=120.0)
+    print(f"\nConnecting to inference server at {INFERENCE_URL}...")
+    client = OpenAIClient(
+        api_key="not-needed",
+        model="local",
+        base_url=f"{INFERENCE_URL.rstrip('/')}/v1",
+        timeout=120.0,
+    )
 
     # Setup arena
-    print("Setting up proposer/solver arena...")
-    arena = ProposerSolverArena(client=client, batch_size=args.batch_size, verbose=args.verbose)
+    arena = ProposerSolverArena(
+        client=client,
+        episodes_per_step=EPISODES_PER_STEP,
+        verbose=args.verbose,
+    )
 
-    # Add roles
-    arena.add_role(Role(
+    # Add actors
+    arena.add_actor(Actor(
         id="Proposer",
-        system_prompt="You are a creative math problem creator. "
-                      "Generate interesting, well-formed problems with clear answers."
-                      "Ensure that in your question you explicitly state the form the answer should be provided in.",
-        temperature=0.9,
-        max_tokens=1024,
+        system_prompt=PROPOSER_SYSTEM_PROMPT,
+        max_tokens=MAX_TOKENS,
     ))
 
-    arena.add_role(Role(
+    arena.add_actor(Actor(
         id="Solver",
-        system_prompt="You are a skilled math problem solver. "
-                      "Think step by step and provide clear, correct answers."
-                      "Ensure that your answer is provided in the form specified in the question.",
-        temperature=0.7,
-        max_tokens=1024,
+        system_prompt=SOLVER_SYSTEM_PROMPT,
+        max_tokens=MAX_TOKENS,
     ))
 
     # Add episodes
-    arena.add_episode("propose", ProposerEpisode(n_solver_rollouts=args.n_solver_rollouts))
+    arena.add_episode("propose", ProposerEpisode(n_solver_rollouts=N_SOLVER_ROLLOUTS))
     arena.add_episode("solve", SolveEpisode())
 
     # Add initial questions to store
     question_store = arena.add_store("questions")
-    for i, q in enumerate(initial_questions):
+    for i, q in enumerate(INITIAL_QUESTIONS):
         question_store.add(Artifact(id=f"seed_{i}", data=q))
 
-    # Dry-run mode: preview arena performance without training
+    # Dry-run mode
     if args.dry_run:
-        await preview_proposer_solver(arena, concurrency=args.concurrency)
+        await preview_proposer_solver(arena, concurrency=EPISODE_CONCURRENCY)
         await client.close()
         return
 
+    # Warmup: ensure we have enough questions before training
+    print("Running arena warmup...")
+    await arena.on_train_start()
+
     # Load model with LoRA
-    model, tokenizer = load_model_with_lora(
-        model_path=args.model_path,
-        lora_rank=args.lora_rank,
-        lora_layers=args.lora_layers,
-    )
-
-    # Setup optimizer
-    optimizer = optim.Adam(learning_rate=args.lr)
-
-    # Setup trainer config
-    config = TrainerConfig(
-        lr=args.lr,
-        micro_token_budget=args.micro_token_budget,
-        max_policy_lag=args.max_policy_lag,
-        batch_size=args.train_batch_size,
-        clip_low=0.8,
-        clip_high=1.2,
-        kl_coef=args.kl_coef,
-        use_kl_penalty=args.use_kl_penalty,
-        weight_push_url=base_url,
-        pad_token_id=tokenizer.pad_token_id or 0,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-    )
-
-    # Setup weight publisher
-    publisher = WeightPublisher(
-        base_url=base_url,
-    )
+    model, tokenizer = load_model_with_lora(MODEL_PATH)
 
     # Setup trainer
-    trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        config=config,
-        publisher=publisher,
+    optimizer = optim.Adam(learning_rate=LR)
+    config = TrainerConfig(
+        lr=LR,
+        micro_batch_tokens=MICRO_BATCH_TOKENS,
+        staleness_limit=STALENESS_LIMIT,
+        min_samples_per_step=MIN_SAMPLES_PER_STEP,
+        ppo_clip_min=0.8,
+        ppo_clip_max=1.2,
+        kl_coef=KL_COEF,
+        use_kl_penalty=USE_KL_PENALTY,
+        inference_url=INFERENCE_URL,
+        pad_token_id=tokenizer.pad_token_id or 0,
+        wandb_project=WANDB_PROJECT,
+        wandb_run_name=WANDB_RUN_NAME,
     )
 
-    print(f"\nStarting training for {args.num_steps} steps...")
-    print(f"  - Batch size: {args.batch_size} episodes per arena step")
-    print(f"  - Train batch size: {args.train_batch_size} records per train step")
-    print(f"  - Solver rollouts per proposal: {args.n_solver_rollouts}")
-    print(f"  - Micro token budget: {args.micro_token_budget}")
-    print(f"  - Max policy lag: {args.max_policy_lag}")
+    trainer = Trainer(model=model, optimizer=optimizer, config=config, client=client)
+
+    print(f"\nStarting training for {NUM_STEPS} steps...")
+    print(f"  - Episodes per step: {EPISODES_PER_STEP}")
+    print(f"  - Min samples per step: {MIN_SAMPLES_PER_STEP}")
+    print(f"  - Solver rollouts per proposal: {N_SOLVER_ROLLOUTS}")
     print()
 
-    if args.simple_loop:
-        # Use simple sequential loop (easier to debug)
-        await simple_training_loop(
-            arena=arena,
-            trainer=trainer,
-            num_steps=args.num_steps,
-            concurrency=args.concurrency,
-            step_concurrency=args.step_concurrency,
-            verbose=args.verbose,
-        )
-    else:
-        # Use async loop with queue (better throughput)
-        batch_queue = asyncio.Queue(maxsize=4)
-        await training_loop(
-            arena=arena,
-            trainer=trainer,
-            batch_queue=batch_queue,
-            num_steps=args.num_steps,
-            concurrency=args.concurrency,
-            step_concurrency=args.step_concurrency,
-            verbose=args.verbose,
-        )
-
-    # Cleanup
-    await publisher.close()
-    await client.close()
+    try:
+        if USE_SIMPLE_LOOP:
+            await synchronous_training_loop(
+                arena=arena,
+                trainer=trainer,
+                num_steps=NUM_STEPS,
+                episode_concurrency=EPISODE_CONCURRENCY,
+                step_concurrency=STEP_CONCURRENCY,
+                verbose=args.verbose,
+            )
+        else:
+            batch_queue = asyncio.Queue(maxsize=4)
+            await training_loop(
+                arena=arena,
+                trainer=trainer,
+                batch_queue=batch_queue,
+                num_steps=NUM_STEPS,
+                episode_concurrency=EPISODE_CONCURRENCY,
+                step_concurrency=STEP_CONCURRENCY,
+                verbose=args.verbose,
+            )
+    finally:
+        await arena.on_train_end()
+        await client.close()
 
     print(f"\nTraining complete! Final step: {trainer.train_step_idx}")
 
@@ -318,47 +300,11 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train proposer/solver agents with RL")
 
-    # Model args
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        default="/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen3-1.7B-MLX-8bit",
-        help="Path to the base model",
-    )
-    parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora-layers", type=int, default=16, help="LoRA layers")
-
-    # Server args
-    parser.add_argument("--url", type=str, default=None, help="Full base URL of inference server (overrides host/port)")
-    parser.add_argument("--host", type=str, default="localhost", help="Inference server host")
-    parser.add_argument("--port", type=int, default=8000, help="Inference server port")
-
-    # Training args
-    parser.add_argument("--num-steps", type=int, default=10, help="Number of training steps")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--batch-size", type=int, default=4, help="Episodes per arena step")
-    parser.add_argument("--train-batch-size", type=int, default=24, help="Records per train step")
-    parser.add_argument("--n-solver-rollouts", type=int, default=4, help="Solver rollouts per proposal")
-    parser.add_argument("--micro-token-budget", type=int, default=4096, help="Tokens per micro-batch")
-    parser.add_argument("--max-policy-lag", type=int, default=3, help="Max staleness (steps)")
-    parser.add_argument("--kl-coef", type=float, default=0.1, help="KL penalty coefficient (0.05-0.2 recommended)")
-    parser.add_argument("--use-kl-penalty", action="store_true", help="Add KL penalty to loss")
-    parser.add_argument("--concurrency", type=int, default=4, help="Max concurrent episodes")
-    parser.add_argument("--step-concurrency", type=int, default=1, help="Max concurrent arena.step() calls")
-
-    # Mode args
-    parser.add_argument(
-        "--simple-loop",
-        action="store_true",
-        help="Use simple sequential loop instead of async",
-    )
+    # Only essential CLI args
     parser.add_argument("--dry-run", action="store_true",
         help="Run single arena step to preview performance (skips training)")
-    parser.add_argument("--verbose", action="store_true", help="Print debug info")
-
-    # Wandb args
-    parser.add_argument("--wandb-project", type=str, default=None, help="Wandb project name (enables logging)")
-    parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name")
+    parser.add_argument("--verbose", action="store_true",
+        help="Print debug info")
 
     args = parser.parse_args()
     asyncio.run(main(args))

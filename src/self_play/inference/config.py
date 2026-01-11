@@ -1,30 +1,22 @@
 """Server configuration."""
 
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel
 
 
-class ServerConfig(BaseSettings):
+class ServerConfig(BaseModel):
     """Configuration for inference server."""
 
-    model_path: str = "/Users/eligottlieb/.lmstudio/models/lmstudio-community/Qwen2.5-7B-Instruct-MLX-4bit"
+    model_path: str = "mlx_model"
     host: str = "0.0.0.0"
     port: int = 8000
     max_batch_size: int = 32
     max_tokens: int = 4096
 
-    # Sampler configuration
+    # Sampler defaults
     temperature: float = 0.7
     top_p: float = 1.0
-    top_k: int = -1  # -1 means disabled
-    repetition_penalty: float = 1.0  # 1.0 = no penalty, >1.0 penalizes repetition
+    top_k: int = -1
+    repetition_penalty: float = 1.0
 
-    # LoRA configuration (sets up empty LoRA layers at startup for weight updates)
-    lora_rank: int | None = None  # If set, enables LoRA with this rank
-    lora_layers: int = -1  # Number of layers to apply LoRA to (-1 for all)
-    lora_scale: float = 64.0  # LoRA scaling factor (lora_alpha)
-    lora_keys: list[str] | None = [
-      "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-      "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"
-  ]
-
-    model_config = {"env_prefix": "SELF_PLAY_"}
+    # LoRA - uses settings from lora.py
+    enable_lora: bool = True

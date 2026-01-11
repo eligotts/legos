@@ -85,7 +85,7 @@ class Episode(ABC):
         Rubric to score this episode.
 
         The rubric's score() method is called with (rollout, arena).
-        It must set rewards for each role_id in rollout.steps.
+        It must set rewards for each actor_id in rollout.steps.
         """
         ...
 
@@ -116,18 +116,18 @@ class Episode(ABC):
 
     async def call_model(
         self,
-        role_id: str,
+        actor_id: str,
         messages: Messages,
         arena: Arena,
     ) -> ModelResponse:
-        """Make a model call for a role."""
-        return await arena.call_model(messages, role_id=role_id)
+        """Make a model call for an actor."""
+        return await arena.call_model(messages, actor_id=actor_id)
 
     # ---------------------------------------------------------------------------
     # Lifecycle methods - override to customize
     # ---------------------------------------------------------------------------
 
-    def startup(self, state: EpisodeState, artifact: Any) -> None:
+    def init_state(self, state: EpisodeState, artifact: Any) -> None:
         """
         Called at the beginning of generate() before rollout().
 
@@ -166,9 +166,9 @@ class Episode(ABC):
         """
         import time
 
-        # Create state and call startup for initialization
+        # Create state and call init_state for initialization
         state = EpisodeState()
-        self.startup(state, artifact)
+        self.init_state(state, artifact)
 
         state = await self.rollout(arena, artifact, state)
 
@@ -214,10 +214,10 @@ async def _run_chat_loop(
     Each model call receives: system prompt + user message with observation and history.
 
     Key concepts:
-    - System prompt: Static per-role instructions (from arena.roles)
+    - System prompt: Static per-actor instructions (from arena.actors)
     - Initial prompt: Shared context at game start (from get_initial_prompt)
-    - Observation: Player-specific state, regenerated each turn (from get_observation)
     - Transcript: Shared conversation log (player responses + action results)
+    - Observation: Player-specific state, regenerated each turn (from get_observation)
 
     The observation is NOT added to transcript - it's private to each player's turn.
     This prevents leaking player-specific info (like personal values) to opponents.
@@ -232,9 +232,9 @@ async def _run_chat_loop(
     transcript: str = ""
 
     while not state.done:
-        # Get system prompt dynamically from the current actor's role
-        current_role = arena.roles.get(state.current_actor)
-        system_prompt = current_role.system_prompt if current_role else None
+        # Get system prompt dynamically from the current actor
+        current_actor = arena.actors.get(state.current_actor)
+        system_prompt = current_actor.system_prompt if current_actor else None
 
         # Build user message with three parts:
         # 1. Observation (player-specific, fresh each turn, NOT in transcript)
@@ -270,7 +270,7 @@ async def _run_chat_loop(
 
         # Record step
         step = Step(
-            role_id=state.current_actor,
+            actor_id=state.current_actor,
             prompt=prompt,
             completion=response.completion,
             prompt_token_ids=response.prompt_token_ids,
@@ -306,17 +306,17 @@ class MultiTurnEpisode(Episode):
     Episode with standard turn-taking chat loop.
 
     Subclasses must implement:
-    - get_initial_actor: which role starts
+    - get_initial_actor: which actor starts
     - get_initial_prompt: shared initial context string
 
     Subclasses may override:
     - get_observation: player-specific state, regenerated each turn (default: None)
     - env_response: action result to append to transcript (default: "")
-    - get_next_actor: which role goes next (default: same actor)
+    - get_next_actor: which actor goes next (default: same actor)
     - is_done: when to stop (default: check max_turns)
 
     Prompt structure each turn:
-    - System: Role's system_prompt (static)
+    - System: Actor's system_prompt (static)
     - User: [observation] + [initial_context on turn 0] + [transcript]
 
     The observation is NOT added to transcript - it's private to each player.

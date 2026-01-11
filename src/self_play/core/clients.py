@@ -3,7 +3,7 @@ Inference clients for model API endpoints.
 
 InferenceClient: Abstract base class for all inference clients.
 MockInferenceClient: Mock client for testing.
-OpenAIClient: OpenAI-compatible client for OpenAI, OpenRouter, and local servers.
+OpenAIClient: OpenAI-compatible client for mlx-vllm
 """
 from __future__ import annotations
 
@@ -41,6 +41,22 @@ class InferenceClient(ABC):
         Override in subclasses that support LoRA hot-swap or similar.
         """
         return 0
+
+    async def publish_weights(self, model, version: int) -> Optional[dict]:
+        """
+        Push updated LoRA weights to the inference server.
+
+        Only supported by local servers with LoRA hot-swap (e.g., mlx-vllm).
+        Returns None if not supported. Override in subclasses that support it.
+
+        Args:
+            model: MLX model with trainable LoRA parameters
+            version: Version number (typically training step)
+
+        Returns:
+            Response dict from server, or None if not supported
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -136,51 +152,6 @@ class OpenAIClient(InferenceClient):
 
         self._client = httpx.AsyncClient(timeout=self.timeout)
         self._call_count = 0
-
-    @classmethod
-    def for_local(
-        cls, host: str = "localhost", port: int = 8000, timeout: float = 120.0
-    ) -> "OpenAIClient":
-        """Create a client for a local OpenAI-compatible server (e.g., mlx-vllm).
-
-        Args:
-            host: The host the server is running on (default: localhost)
-            port: The port the server is running on (default: 8000)
-            timeout: Request timeout in seconds (default: 120s for local inference)
-
-        Returns:
-            OpenAIClient configured for the server
-        """
-        return cls(
-            api_key="not-needed",
-            model="local",
-            base_url=f"http://{host}:{port}/v1",
-            timeout=timeout,
-        )
-
-    @classmethod
-    def for_openrouter(
-        cls,
-        api_key: Optional[str] = None,
-        model: str = "openai/gpt-4o-mini",
-        timeout: float = 60.0,
-    ) -> "OpenAIClient":
-        """Create a client for OpenRouter.
-
-        Args:
-            api_key: OpenRouter API key (or set OPENROUTER_API_KEY env var)
-            model: Model ID (default: openai/gpt-4o-mini)
-            timeout: Request timeout in seconds
-
-        Returns:
-            OpenAIClient configured for OpenRouter
-        """
-        return cls(
-            api_key=api_key,
-            model=model,
-            base_url="https://openrouter.ai/api/v1",
-            timeout=timeout,
-        )
 
     async def complete(
         self,
@@ -307,6 +278,71 @@ class OpenAIClient(InferenceClient):
         except Exception:
             # Connection refused, timeout, 404, etc. - all return 0
             return 0
+
+    async def publish_weights(self, model, version: int) -> Optional[dict]:
+        """
+        Push updated LoRA weights to the inference server.
+
+        Works with any server that supports the /adapters/load endpoint
+        (e.g., mlx-vllm with LoRA hot-swap).
+
+        Args:
+            model: MLX model with trainable LoRA parameters
+            version: Version number (typically training step)
+
+        Returns:
+            Response dict from server with {"status": "ok", "version": N}
+        """
+        # Lazy imports to avoid forcing MLX deps on inference-only usage
+        import base64
+        import mlx.core as mx
+        import numpy as np
+        from mlx.utils import tree_flatten
+        from safetensors.numpy import save as save_safetensors
+
+        # Extract LoRA weights (trainable parameters only)
+        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+
+        if not adapter_weights:
+            raise ValueError("Model has no trainable parameters. Did you attach LoRA?")
+
+        # Evaluate to materialize lazy arrays
+        mx.eval(adapter_weights)
+
+        # Convert to numpy (cast bfloat16 to float32 since numpy doesn't support bf16)
+        def to_numpy(arr: mx.array) -> np.ndarray:
+            if arr.dtype == mx.bfloat16:
+                return np.array(arr.astype(mx.float32))
+            return np.array(arr)
+
+        weights_np = {k: to_numpy(v) for k, v in adapter_weights.items()}
+
+        # Serialize to safetensors and base64 encode
+        weight_bytes = save_safetensors(weights_np)
+        weights_b64 = base64.b64encode(weight_bytes).decode("utf-8")
+
+        # Compute base URL without /v1 suffix
+        base = self.base_url
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        # POST to /adapters/load
+        response = await self._client.post(
+            f"{base}/adapters/load",
+            json={"weights": weights_b64, "version": version},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        # Clean up intermediate data to free memory
+        del adapter_weights
+        del weights_np
+        del weight_bytes
+        del weights_b64
+        mx.clear_cache()
+
+        return result
 
     async def close(self):
         """Close the HTTP client."""

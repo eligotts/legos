@@ -4,7 +4,7 @@ RL loss computation for policy gradient training.
 Uses PPO-style clipped importance sampling:
 - Forward pass to recompute logprobs under current policy
 - PPO-style clipped objective with importance ratio
-- KL penalty to prevent policy collapse (K1 advantage shaping)
+- KL penalty to prevent policy collapse (K1 advantage shaping - inspired by arXiv:2512.21852)
 """
 from contextlib import contextmanager
 from typing import Dict, Tuple
@@ -38,12 +38,7 @@ def get_per_token_logps(
     # Compute log-softmax
     log_probs = nn.log_softmax(logits, axis=-1)  # (batch, seq_len - 1, vocab_size)
 
-    # Gather log-probs for the actual tokens
-    # targets shape: (batch, seq_len - 1)
-    # We need to index into log_probs using targets
-    batch_size, seq_len_minus_1, vocab_size = log_probs.shape
-
-    # Expand targets for gathering
+    # Gather log-probs for the actual target tokens
     targets_expanded = mx.expand_dims(targets, axis=-1)  # (batch, seq_len - 1, 1)
     token_log_probs = mx.take_along_axis(log_probs, targets_expanded, axis=-1)
     token_log_probs = mx.squeeze(token_log_probs, axis=-1)  # (batch, seq_len - 1)
@@ -279,14 +274,14 @@ def compute_loss(
         clip_fraction = (is_clipped * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1.0)
         metrics["clip_fraction"] = clip_fraction
 
-    # Approximate KL divergence (K2): (r - 1) - log(r) ≈ 0.5 * (log_r)^2
+    # Approximate KL divergence: 0.5 * (log_ratio)^2
     # Kept for monitoring, not added to loss (K1 shaping is used instead when enabled)
     approx_kl = 0.5 * (log_ratio**2)
     mean_kl = (approx_kl * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1.0)
     metrics["kl"] = mean_kl
 
     # Clip fraction gating: skip batch if too many tokens are clipped
-    # This indicates the policy has diverged too much from the reference
+    # This indicates the policy has diverged too much from the inference policy
     skip_batch = clip_fraction > clip_skip_threshold
     metrics["skip_batch"] = skip_batch
 

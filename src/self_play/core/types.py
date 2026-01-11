@@ -3,7 +3,7 @@ Core types for the self-play engine.
 
 All data structures are defined here:
 - Message types: Message, Messages
-- Role: a trainable entity (only trainable entities are roles)
+- Actor: a trainable entity (only trainable entities are actors)
 - Step: one model call in a rollout
 - Rollout: complete trace of an episode (includes artifact + metadata)
 - TrainingRecord: what gets sent to the trainer
@@ -29,16 +29,15 @@ Messages = List[Message]
 
 
 @dataclass
-class Role:
+class Actor:
     """
-    A trainable role. Only roles produce training data.
+    A trainable actor. Only actors produce training data.
 
-    The judge in a debate is NOT a role - it's part of the verifier.
-    Only entities whose completions get trained on are roles.
+    The judge in a debate is NOT an actor - it's part of the verifier.
+    Only entities whose completions get trained on are actors.
     """
     id: str
     system_prompt: str = ""
-    temperature: float = 1.0
     max_tokens: Optional[int] = None
 
     def build_messages(self, user_content: str, history: Optional[Messages] = None) -> Messages:
@@ -60,7 +59,7 @@ class Step:
     Stores the full prompt and completion messages for this turn,
     plus token-level data for training.
     """
-    role_id: str
+    actor_id: str
     prompt: Messages  # Full prompt for this turn
     completion: Messages  # Model's response as messages
 
@@ -116,8 +115,8 @@ class Rollout:
     extras: Dict[str, Any] = field(default_factory=dict)        # Episode-specific data
 
     # === Set by Rubric.score() ===
-    rewards: Dict[str, float] = field(default_factory=dict)     # role_id -> reward
-    advantages: Dict[str, float] = field(default_factory=dict)  # role_id -> advantage
+    rewards: Dict[str, float] = field(default_factory=dict)     # actor_id -> reward
+    advantages: Dict[str, float] = field(default_factory=dict)  # actor_id -> advantage
     metrics: Dict[str, float] = field(default_factory=dict)     # func_name -> value
 
     # Timing
@@ -126,8 +125,8 @@ class Rollout:
 
     @property
     def actors(self) -> set[str]:
-        """Return unique role IDs from all steps in this rollout."""
-        return {step.role_id for step in self.steps}
+        """Return unique actor IDs from all steps in this rollout."""
+        return {step.actor_id for step in self.steps}
 
 
 @dataclass
@@ -138,7 +137,7 @@ class TrainingRecord:
     One record per trainable step. The trainer doesn't know
     about episodes, verifiers, or arenas.
     """
-    role_id: str
+    actor_id: str
     rollout_id: str
 
     # Token sequences
@@ -217,7 +216,7 @@ class GenerateResult:
 
     @property
     def rewards(self) -> Dict[str, float]:
-        """Rewards dict from the rollout (role_id -> reward)."""
+        """Rewards dict from the rollout (actor_id -> reward)."""
         return self.rollout.rewards
 
     def all_rollouts(self) -> List[Rollout]:

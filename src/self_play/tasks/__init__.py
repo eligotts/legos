@@ -6,7 +6,7 @@ These tasks demonstrate how to implement various self-play scenarios:
 2. GSM8K: Math reasoning with GRPO-style training
 3. Negotiation: SPIRAL-style SimpleNegotiation with RAE credit assignment
 4. RefineLoop: Generator-Critic iterative refinement (cooperative)
-5. EloArena: Tournament competition with persistent Elo ratings
+5. HeadToHead: Tournament competition with LLM-judged matches
 6. SPICE: Self-Play In Corpus Environment (corpus-grounded Q&A generation)
 
 See examples/train_*.py scripts for complete usage.
@@ -39,10 +39,11 @@ from .refine_loop import (
     refine_loop_reward,
 )
 
-from .elo_arena import (
-    EloMatchEpisode,
-    EloArena,
-    elo_match_reward,
+from .head_to_head import (
+    MatchEpisode,
+    ChallengeProposerEpisode,
+    HeadToHeadArena,
+    match_reward,
 )
 
 from .spice import (
@@ -74,10 +75,11 @@ __all__ = [
     "RefineLoopEpisode",
     "RefineLoopArena",
     "refine_loop_reward",
-    # EloArena (tournament competition)
-    "EloMatchEpisode",
-    "EloArena",
-    "elo_match_reward",
+    # HeadToHead (tournament competition)
+    "MatchEpisode",
+    "ChallengeProposerEpisode",
+    "HeadToHeadArena",
+    "match_reward",
     # SPICE (corpus-grounded Q&A)
     "SpiceProposerEpisode",
     "SpiceSolverEpisode",

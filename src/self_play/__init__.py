@@ -4,17 +4,17 @@ Self-Play LLM RL Engine
 A modular framework for self-play training of language models.
 
 Core Concepts:
-- Role: A trainable entity (only trainable entities are roles)
+- Actor: A trainable entity (only trainable entities are actors)
 - Episode: Defines how a single rollout unfolds (SingleTurn or MultiTurn)
 - Rubric: Function that scores rollouts
 - Arena: Persistent state container + orchestration
 
 Example Usage:
-    from self_play import Arena, Role, MockInferenceClient
+    from self_play import Arena, Actor, MockInferenceClient
     from self_play.tasks import GSM8KArena, GSM8KEpisode
 
     # Create arena with GSM8K setup
-    arena = GSM8KArena(client=MockInferenceClient(), batch_size=4)
+    arena = GSM8KArena(client=MockInferenceClient(), episodes_per_step=4)
     arena.add_episode("gsm8k", GSM8KEpisode())
 
     # Run a training step
@@ -25,7 +25,7 @@ from .core import (
     # Types
     Message,
     Messages,
-    Role,
+    Actor,
     Step,
     Rollout,
     TrainingRecord,
@@ -65,7 +65,7 @@ __all__ = [
     # Types
     "Message",
     "Messages",
-    "Role",
+    "Actor",
     "Step",
     "Rollout",
     "TrainingRecord",
