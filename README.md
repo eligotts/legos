@@ -2,7 +2,7 @@
 
 **Learning through Evolutionary Game Orchestration Systems**
 
-Build any multi-agent interaction into a self-improving training loop—debate, curriculum generation, adversarial games, verification cascades—all expressible in the same 50-line Episode subclass.
+Build any multi-agent interaction into a self-improving training loop through a unified set of abstractions.
 
 **The Self-Play Thesis**
 
