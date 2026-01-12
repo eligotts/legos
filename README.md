@@ -12,7 +12,7 @@ When you look deeper at these various self-play setups, common patterns emerge. 
 
 **Why MLX?**
 
-After passively riding the RL hype train this past year, which manifested in way too many hours of TPOT doomscrolling plus adding a few environments to [PI's Environments Hub](https://app.primeintellect.ai/dashboard/environments/ergotts/socratic-method), it felt like there was no better way to consolidate everything I'd been learning than just building a training library from scratch (whatever "from scratch" means these days). And why MLX? Feels like a growing community that is lacking an RL library like this, so maybe this could actually make an impact? Also, so I could finally make use of the somewhat rash decision to max out my macbook air memory.
+After passively riding the RL hype train this past year, which manifested in way too many hours of TPOT doomscrolling plus adding a few environments to [PI's Environments Hub](https://app.primeintellect.ai/dashboard/environments/ergotts/socratic-method), it felt like there was no better way to consolidate everything I'd been learning than just building a training library from scratch (whatever "from scratch" means these days). And after making the somewhat rash decision to max out my macbook air memory, it was only right to build this in MLX.
 
 And yes, LoRA only. Easy, simple, and all I really wanted to handle for now.
 
