@@ -1,6 +1,6 @@
 # LEGOS
 
-**Learning through Evolutionary Game Optimization Systems**
+**Learning through Evolutionary Game Orchestration Systems**
 
 This project was borne out of my goal to build a library that 1) treats the patterns of LLM self-play as first class entities, and 2) uses the latest best practices in reinforcement learning training optimized for Apple Silicon using MLX.
 
