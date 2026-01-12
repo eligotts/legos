@@ -19,7 +19,7 @@ dependencies = [
     "huggingface-hub>=0.26.0",
     "transformers>=5.0.0rc1",
     # Training dependencies
-    "mlx>=0.0.10",
+    "mlx>=0.30.0",
     "mlx-lm>=0.30.0",
     "safetensors>=0.4.0",
     "numpy>=1.24.0",

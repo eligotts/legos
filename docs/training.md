@@ -278,7 +278,7 @@ Benefits:
 
 ```bash
 uv run legos serve \
-    --model mlx-community/Qwen2.5-1.5B-Instruct-4bit \
+    --model mlx-community/qwen3-1.7b \
     --port 8000
 ```
 
@@ -337,7 +337,7 @@ A complete training run:
 
 ```python
 # 1. Initialize components
-model, tokenizer = load("mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+model, tokenizer = load("mlx-community/qwen3-1.7b")
 apply_lora(model, inference_mode=False)
 
 optimizer = optim.Adam(learning_rate=1e-5)
