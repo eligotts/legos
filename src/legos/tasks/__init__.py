@@ -8,6 +8,7 @@ These tasks demonstrate how to implement various self-play scenarios:
 4. RefineLoop: Generator-Critic iterative refinement (cooperative)
 5. HeadToHead: Tournament competition with LLM-judged matches
 6. SPICE: Self-Play In Corpus Environment (corpus-grounded Q&A generation)
+7. RLM: Recursive Language Model (recursive self-spawning episodes)
 
 See examples/train_*.py scripts for complete usage.
 """
@@ -53,6 +54,12 @@ from .spice import (
     proposer_pass_rate_reward,
 )
 
+from .rlm import (
+    RLMEpisode,
+    RLMArena,
+    hierarchical_reward,
+)
+
 __all__ = [
     # Proposer/Solver
     "ProposerEpisode",
@@ -85,4 +92,8 @@ __all__ = [
     "SpiceArena",
     "solver_llm_judge_reward",
     "proposer_pass_rate_reward",
+    # RLM (Recursive Language Model)
+    "RLMEpisode",
+    "RLMArena",
+    "hierarchical_reward",
 ]
