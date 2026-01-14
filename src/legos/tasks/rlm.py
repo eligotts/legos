@@ -169,7 +169,7 @@ Use [CODE] to inspect, [SPAWN] to delegate, [ANSWER] when ready."""
                 EpisodeRequest(
                     episode_type="rlm",  # Same type - recursive!
                     artifact={
-                        "context": state.data["context"],  # Pass context down
+                        "context": state.data["context"],  # Pass context down, or theoretically do whatever you want here for passing context
                         "question": prompt,
                         "answer": "",  # Sub-tasks don't have ground truth
                         "is_root": False,  # Mark as nested
