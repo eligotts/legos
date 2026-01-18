@@ -219,7 +219,7 @@ class Arena:
         """
         Convert rollouts into trainer-consumable batch.
 
-        Flattens all results (including children) into TrainingRecords.
+        Flattens all results (including children and continuation chains) into TrainingRecords.
         Each step's reward comes from step.reward (set by Rubric).
         """
         records: List[TrainingRecord] = []
@@ -229,39 +229,41 @@ class Arena:
             if not result.is_trainable:
                 return
 
-            rollout = result.rollout
+            # Process all segments in the continuation chain
+            for segment in result.iter_chain():
+                rollout = segment.rollout
 
-            for step in rollout.steps:
-                if step.prompt_token_ids is None or step.completion_token_ids is None:
-                    continue
+                for step in rollout.steps:
+                    if step.prompt_token_ids is None or step.completion_token_ids is None:
+                        continue
 
-                # Skip steps with zero advantage
-                if step.advantage == 0:
-                    continue
+                    # Skip steps with zero advantage
+                    if step.advantage == 0:
+                        continue
 
-                action_mask = [0] * len(step.prompt_token_ids) + [1] * len(step.completion_token_ids)
+                    action_mask = [0] * len(step.prompt_token_ids) + [1] * len(step.completion_token_ids)
 
-                records.append(TrainingRecord(
-                    actor_id=step.actor_id,
-                    rollout_id=rollout.id,
-                    prompt_token_ids=step.prompt_token_ids,
-                    completion_token_ids=step.completion_token_ids,
-                    logprobs=step.completion_logprobs or [],
-                    action_mask=action_mask,
-                    reward=step.reward,
-                    advantage=step.advantage,
-                    prompt_text=step.prompt_text,
-                    completion_text=step.completion_text,
-                    meta={
-                        "episode_type": rollout.episode_type,
-                        "artifact": rollout.artifact,
-                        "extras": rollout.extras,
-                        **rollout.meta,
-                    },
-                ))
+                    records.append(TrainingRecord(
+                        actor_id=step.actor_id,
+                        rollout_id=rollout.id,
+                        prompt_token_ids=step.prompt_token_ids,
+                        completion_token_ids=step.completion_token_ids,
+                        logprobs=step.completion_logprobs or [],
+                        action_mask=action_mask,
+                        reward=step.reward,
+                        advantage=step.advantage,
+                        prompt_text=step.prompt_text,
+                        completion_text=step.completion_text,
+                        meta={
+                            "episode_type": rollout.episode_type,
+                            "artifact": rollout.artifact,
+                            "extras": rollout.extras,
+                            **rollout.meta,
+                        },
+                    ))
 
-            for child in result.children:
-                process(child)
+                for child in segment.children:
+                    process(child)
 
         for result in results:
             process(result)

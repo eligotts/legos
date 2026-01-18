@@ -36,6 +36,9 @@ class EpisodeState:
     # Child results from sub-episodes
     child_results: List[GenerateResult] = field(default_factory=list)
 
+    # Continuation request for context overflow handling (RLM-specific)
+    continuation_request: Optional[Dict[str, Any]] = None
+
     @property
     def turn(self) -> int:
         return len(self.trajectory)

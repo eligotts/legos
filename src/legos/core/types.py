@@ -16,7 +16,7 @@ All data structures are defined here:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING
 import uuid
 import time
 
@@ -209,9 +209,10 @@ class EpisodeRequest:
 
 @dataclass
 class GenerateResult:
-    """Result from episode.generate(), supports hierarchical episodes."""
+    """Result from episode.generate(), supports hierarchical episodes and continuation chains."""
     rollout: Rollout
     children: List["GenerateResult"] = field(default_factory=list)
+    next: Optional["GenerateResult"] = None  # Continuation segment for context overflow
     is_trainable: bool = True
 
     @property
@@ -219,11 +220,20 @@ class GenerateResult:
         """Rewards dict from the rollout (actor_id -> reward)."""
         return self.rollout.rewards
 
+    def iter_chain(self) -> Iterator["GenerateResult"]:
+        """Iterate through this result and all continuation segments."""
+        current: Optional[GenerateResult] = self
+        while current is not None:
+            yield current
+            current = current.next
+
     def all_rollouts(self) -> List[Rollout]:
-        """Flatten tree into list of rollouts."""
+        """Flatten tree (including continuation chains) into list of rollouts."""
         result = [self.rollout]
         for child in self.children:
             result.extend(child.all_rollouts())
+        if self.next:
+            result.extend(self.next.all_rollouts())
         return result
 
 

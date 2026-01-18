@@ -85,14 +85,16 @@ def apply_credit(
         if not result.is_trainable:
             return
 
-        rollout = result.rollout
-        for i, step in enumerate(rollout.steps):
-            key = (rollout.id, i)
-            if key in weights:
-                step.advantage = weights[key]
+        # Apply to all segments in the chain
+        for segment in result.iter_chain():
+            rollout = segment.rollout
+            for i, step in enumerate(rollout.steps):
+                key = (rollout.id, i)
+                if key in weights:
+                    step.advantage = weights[key]
 
-        for child in result.children:
-            apply_to_result(child)
+            for child in segment.children:
+                apply_to_result(child)
 
     for result in results:
         apply_to_result(result)
@@ -214,11 +216,14 @@ class GRPOCredit(CreditAssigner):
             actor_keys = _get_actor_keys(rollouts)
 
             if not actor_keys:
-                # No rewards set - assign 0 to all steps
+                # No rewards set - assign 0 to all steps in chain
                 for result in group_results:
-                    rollout = result.rollout
-                    for i, _ in enumerate(rollout.steps):
-                        weights[(rollout.id, i)] = 0.0
+                    for segment in result.iter_chain():
+                        for i, _ in enumerate(segment.rollout.steps):
+                            weights[(segment.rollout.id, i)] = 0.0
+                        # Still need to recurse into children
+                        if segment.children:
+                            self._compute_level(segment.children, weights)
             else:
                 # Compute advantages per actor
                 actor_advantages: Dict[str, List[float]] = {}
@@ -230,21 +235,20 @@ class GRPOCredit(CreditAssigner):
 
                 # Assign advantage to each step based on step's actor_id
                 for idx, result in enumerate(group_results):
-                    rollout = result.rollout
-                    for i, step in enumerate(rollout.steps):
-                        # Get advantage for this step's actor
-                        if step.actor_id in actor_advantages:
-                            adv = actor_advantages[step.actor_id][idx]
-                        else:
-                            # Step's actor not in rewards dict - use 0
-                            adv = 0.0
-                        weights[(rollout.id, i)] = adv
+                    # Apply to ALL segments in chain
+                    for segment in result.iter_chain():
+                        for i, step in enumerate(segment.rollout.steps):
+                            # Get advantage for this step's actor
+                            if step.actor_id in actor_advantages:
+                                adv = actor_advantages[step.actor_id][idx]
+                            else:
+                                # Step's actor not in rewards dict - use 0
+                                adv = 0.0
+                            weights[(segment.rollout.id, i)] = adv
 
-        # Recurse into children (each parent's children form independent groups)
-        # Only recurse into trainable results - non-trainable subtrees are skipped
-        for result in trainable_results:
-            if result.children:
-                self._compute_level(result.children, weights)
+                        # Recurse into children of each segment
+                        if segment.children:
+                            self._compute_level(segment.children, weights)
 
 
 # ---------------------------------------------------------------------------
@@ -278,11 +282,13 @@ class ConstantCredit(CreditAssigner):
             if not result.is_trainable:
                 continue
 
-            rollout = result.rollout
-            for i, _ in enumerate(rollout.steps):
-                weights[(rollout.id, i)] = self.value
+            # Process all segments in the chain
+            for segment in result.iter_chain():
+                rollout = segment.rollout
+                for i, _ in enumerate(rollout.steps):
+                    weights[(rollout.id, i)] = self.value
 
-            self._assign_all(result.children, weights)
+                self._assign_all(segment.children, weights)
 
 
 @dataclass
@@ -312,14 +318,16 @@ class EpisodicRewardCredit(CreditAssigner):
             if not result.is_trainable:
                 continue
 
-            rollout = result.rollout
+            # Process all segments in the chain
+            for segment in result.iter_chain():
+                rollout = segment.rollout
 
-            for i, step in enumerate(rollout.steps):
-                # Get reward for this step's actor
-                reward = rollout.rewards.get(step.actor_id, 0.0)
-                weights[(rollout.id, i)] = reward
+                for i, step in enumerate(rollout.steps):
+                    # Get reward for this step's actor
+                    reward = rollout.rewards.get(step.actor_id, 0.0)
+                    weights[(rollout.id, i)] = reward
 
-            self._assign_all(result.children, weights)
+                self._assign_all(segment.children, weights)
 
 
 # ---------------------------------------------------------------------------
@@ -410,11 +418,14 @@ class RAECredit(CreditAssigner):
             actor_keys = _get_actor_keys(rollouts)
 
             if not actor_keys:
-                # No rewards set - assign 0 to all steps
+                # No rewards set - assign 0 to all steps in chain
                 for result in group_results:
-                    rollout = result.rollout
-                    for i, _ in enumerate(rollout.steps):
-                        weights[(rollout.id, i)] = 0.0
+                    for segment in result.iter_chain():
+                        for i, _ in enumerate(segment.rollout.steps):
+                            weights[(segment.rollout.id, i)] = 0.0
+                        # Still need to recurse into children
+                        if segment.children:
+                            self._compute_level(segment.children, weights)
                 continue
 
             # Compute mean reward per actor across this batch (for batch-wise EMA update)
@@ -445,16 +456,16 @@ class RAECredit(CreditAssigner):
 
             # Assign advantage to each step based on step's actor_id
             for idx, result in enumerate(group_results):
-                rollout = result.rollout
-                for i, step in enumerate(rollout.steps):
-                    if step.actor_id in actor_advantages:
-                        adv = actor_advantages[step.actor_id][idx]
-                    else:
-                        # Step's actor not in rewards dict - use 0
-                        adv = 0.0
-                    weights[(rollout.id, i)] = adv
+                # Apply to ALL segments in chain
+                for segment in result.iter_chain():
+                    for i, step in enumerate(segment.rollout.steps):
+                        if step.actor_id in actor_advantages:
+                            adv = actor_advantages[step.actor_id][idx]
+                        else:
+                            # Step's actor not in rewards dict - use 0
+                            adv = 0.0
+                        weights[(segment.rollout.id, i)] = adv
 
-        # Recurse into children (each parent's children form independent groups)
-        for result in trainable_results:
-            if result.children:
-                self._compute_level(result.children, weights)
+                    # Recurse into children of each segment
+                    if segment.children:
+                        self._compute_level(segment.children, weights)

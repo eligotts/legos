@@ -15,7 +15,7 @@ RLM Paper: https://arxiv.org/abs/2512.24601
 import re
 from typing import Any, Dict, List, Tuple
 
-from legos.core.episode import MultiTurnEpisode, EpisodeState
+from legos.core.episode import MultiTurnEpisode, SingleTurnEpisode, EpisodeState
 from legos.core.arena import Arena
 from legos.core.rubric import Rubric
 from legos.core.credit import GRPOCredit
@@ -48,6 +48,13 @@ Sub-task 2
 Your final answer
 [/ANSWER]
 """
+
+SUMMARIZER_SYSTEM_PROMPT = """You are a context summarizer.
+Condense the conversation history into a concise summary preserving:
+- Key facts and findings
+- Current progress on the task
+- Important context for continuing
+Be brief but complete."""
 
 
 # =============================================================================
@@ -91,6 +98,8 @@ class RLMEpisode(MultiTurnEpisode):
     2. Recursive: [SPAWN] creates new RLMEpisode instances
     3. Trainable children: All spawned episodes enter training batch
     4. Hierarchical reward: Root score propagates to all descendants
+    5. Context continuation: When context threshold hit, spawns summarizer
+       and continues in a new episode segment linked via .next
 
     The episode behaves identically whether root or nested - both have
     access to REPL, both can spawn sub-episodes, both can answer.
@@ -98,8 +107,9 @@ class RLMEpisode(MultiTurnEpisode):
 
     episode_type = "rlm"
 
-    def __init__(self, max_turns: int = 10):
+    def __init__(self, max_turns: int = 10, context_threshold: int = 4000):
         super().__init__(max_turns=max_turns)
+        self.context_threshold = context_threshold
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -154,14 +164,17 @@ Use [CODE] to inspect, [SPAWN] to delegate, [ANSWER] when ready."""
         - [CODE] would execute in a REPL (mocked here)
         - [SPAWN] creates new RLMEpisodes via arena.generate_rollouts()
         - [ANSWER] stores the final answer
+        - Context threshold detection triggers summarization and continuation
         """
         text = state.trajectory[-1].completion[0]["content"]
         action, data = parse_action(text)
 
+        response_str = ""
+
         if action == "code":
             # NOTE: In production, this would execute in a sandboxed REPL.
             # For this proof of concept, we just acknowledge the code.
-            return "[Code executed - output would appear here]"
+            response_str = "[Code executed - output would appear here]"
 
         elif action == "spawn":
             # Spawn sub-episodes for each prompt in the list
@@ -169,7 +182,7 @@ Use [CODE] to inspect, [SPAWN] to delegate, [ANSWER] when ready."""
                 EpisodeRequest(
                     episode_type="rlm",  # Same type - recursive!
                     artifact={
-                        "context": state.data["context"],  # Pass context down, or theoretically do whatever you want here for passing context
+                        "context": state.data["context"],  # Pass context down
                         "question": prompt,
                         "answer": "",  # Sub-tasks don't have ground truth
                         "is_root": False,  # Mark as nested
@@ -187,13 +200,47 @@ Use [CODE] to inspect, [SPAWN] to delegate, [ANSWER] when ready."""
                 ans = r.rollout.extras.get("final_answer", "[no answer]")
                 answers.append(f"[{i+1}] {ans}")
 
-            return "Sub-results:\n" + "\n".join(answers)
+            response_str = "Sub-results:\n" + "\n".join(answers)
 
         elif action == "answer":
             state.data["final_answer"] = data
-            return "[Answer recorded]"
+            response_str = "[Answer recorded]"
 
-        return "[No action recognized]"
+        else:
+            response_str = "[No action recognized]"
+
+        # Check context threshold after each turn
+        context_tokens = self._estimate_context_tokens(state)
+        if context_tokens > self.context_threshold:
+            # Spawn summarizer as child (trainable, will get same reward via hierarchical_reward)
+            summary_request = EpisodeRequest(
+                episode_type="summarize",
+                artifact={
+                    "question": state.data["question"],
+                    "history": self._build_history(state),
+                },
+                is_trainable=True,
+            )
+            summary_results = await arena.generate_rollouts([summary_request])
+            state.child_results.extend(summary_results)
+
+            summary_text = summary_results[0].rollout.extras.get("summary", "")
+
+            # Request continuation with summarized context
+            # Pass through is_root status - if we're root, continuation maintains that
+            state.continuation_request = {
+                "episode_type": "rlm",
+                "artifact": {
+                    "context": summary_text,  # Summarized context replaces full history
+                    "question": state.data["question"],
+                    "answer": state.data["ground_truth"],
+                    "is_root": state.data.get("is_root", True),
+                },
+            }
+            state.done = True
+            return "[Context limit reached, summarizing and continuing...]"
+
+        return response_str
 
     def is_done(self, state: EpisodeState, artifact: Any) -> bool:
         """Episode ends when answer submitted or max turns reached."""
@@ -224,6 +271,133 @@ Use [CODE] to inspect, [SPAWN] to delegate, [ANSWER] when ready."""
     def rubric(self) -> Rubric:
         return Rubric([hierarchical_reward])
 
+    # -------------------------------------------------------------------------
+    # Context Continuation (Override generate to handle .next chaining)
+    # -------------------------------------------------------------------------
+
+    async def generate(
+        self,
+        arena: Arena,
+        artifact: Any,
+        meta: Dict[str, Any] = None,
+        is_trainable: bool = True,
+    ) -> GenerateResult:
+        """
+        Override to handle continuation before scoring.
+
+        When context threshold is hit during rollout:
+        1. Spawns Summarizer as child (trainable, will get same reward)
+        2. Sets continuation_request for new segment
+        3. After rollout, launches continuation and links via .next
+        4. Each segment scores independently with same final_answer -> same reward
+        """
+        import time
+
+        # Create state and call init_state for initialization
+        state = EpisodeState()
+        self.init_state(state, artifact)
+
+        state = await self.rollout(arena, artifact, state)
+
+        # Handle continuation BEFORE building rollout extras
+        continuation = None
+        final_answer = state.data.get("final_answer")
+
+        if state.continuation_request is not None:
+            # Launch continuation - it handles its own scoring recursively
+            continuation = await arena.run_episode(
+                state.continuation_request["episode_type"],
+                state.continuation_request["artifact"],
+                meta=meta,
+                is_trainable=is_trainable,
+            )
+            # Grab final_answer from continuation's rollout (it already has it set)
+            final_answer = continuation.rollout.extras.get("final_answer")
+
+        # Build rollout with final_answer (whether from us or continuation)
+        is_root = state.data.get("is_root", True)
+        rollout = Rollout(
+            episode_type=self.episode_type,
+            artifact=artifact,
+            meta=meta or {},
+            steps=state.trajectory,
+            extras={
+                "final_answer": final_answer,
+                "ground_truth": state.data.get("ground_truth", ""),
+                "is_root": is_root,
+                "child_results": state.child_results,
+            },
+            ended_at=time.time(),
+        )
+
+        # Score - rubric computes reward and propagates to children
+        await self.rubric.score(rollout, arena)
+
+        return GenerateResult(
+            rollout=rollout,
+            children=state.child_results,
+            next=continuation,
+            is_trainable=is_trainable,
+        )
+
+    def _estimate_context_tokens(self, state: EpisodeState) -> int:
+        """Estimate current context size in tokens (rough: 4 chars per token)."""
+        total_chars = sum(
+            len(step.prompt_text) + len(step.completion_text)
+            for step in state.trajectory
+        )
+        return total_chars // 4
+
+    def _build_history(self, state: EpisodeState) -> str:
+        """Build conversation history string for summarization."""
+        lines = []
+        for i, step in enumerate(state.trajectory):
+            lines.append(f"Turn {i+1}: {step.completion_text[:500]}...")
+        return "\n".join(lines)
+
+
+# =============================================================================
+# Summarization Episode
+# =============================================================================
+
+class SummarizationEpisode(SingleTurnEpisode):
+    """
+    Episode for summarizing conversation history.
+
+    Used when RLMEpisode hits context threshold to compress history
+    before continuing in a new segment.
+    """
+
+    episode_type = "summarize"
+
+    def get_initial_actor(self, artifact: Any, state: EpisodeState) -> str:
+        return "Summarizer"
+
+    def get_initial_prompt(
+        self,
+        arena: Arena,
+        artifact: Any,
+        state: EpisodeState,
+    ) -> str:
+        question = artifact.get("question", "")
+        history = artifact.get("history", "")
+        return f"""Summarize this conversation for continuation:
+
+Task: {question}
+
+History:
+{history}
+
+Provide a concise summary that preserves key facts, findings, and progress."""
+
+    def get_extras(self, state: EpisodeState) -> Dict[str, Any]:
+        return {"summary": state.last_completion_text}
+
+    @property
+    def rubric(self) -> Rubric:
+        # Summarizer gets reward via hierarchical propagation from parent RLM
+        return Rubric([lambda rollout, arena: {"Summarizer": 0.0}])
+
 
 # =============================================================================
 # Reward Function
@@ -240,6 +414,8 @@ def hierarchical_reward(rollout: Rollout, arena: Arena) -> Dict[str, float]:
 
     The result: every step in every nested episode gets the same reward
     as the root, creating aligned training signal across the recursion.
+
+    Note: This propagates to both RLM sub-episodes and Summarizer episodes.
     """
     is_root = rollout.extras.get("is_root", True)
 
@@ -252,11 +428,12 @@ def hierarchical_reward(rollout: Rollout, arena: Arena) -> Dict[str, float]:
     truth = rollout.extras.get("ground_truth", "").strip().lower()
     reward = 1.0 if (final == truth or truth in final) else 0.0
 
-    # Propagate reward to all descendants
+    # Propagate reward to all descendants (including Summarizer children)
     def propagate(children: List[GenerateResult], value: float) -> None:
         for child in children:
-            child.rollout.rewards["RLM"] = value
+            # Get the actor IDs from steps in this child rollout
             for step in child.rollout.steps:
+                child.rollout.rewards[step.actor_id] = value
                 step.reward = value
             propagate(child.children, value)
 
@@ -274,8 +451,8 @@ class RLMArena(Arena):
     Arena for RLM training.
 
     Demonstrates:
-    - Single actor registration
-    - Single recursive episode type
+    - Actor registration (RLM + Summarizer)
+    - Recursive episode type with context continuation
     - GRPO-style batching (same task N times)
     """
 
@@ -284,15 +461,18 @@ class RLMArena(Arena):
         client,
         data: List[Dict],
         episodes_per_step: int = 4,
+        context_threshold: int = 4000,
     ):
         super().__init__(client, credit_assigner=GRPOCredit())
         self.episodes_per_step = episodes_per_step
 
-        # One actor
+        # Actors
         self.add_actor(Actor(id="RLM", system_prompt=RLM_SYSTEM_PROMPT))
+        self.add_actor(Actor(id="Summarizer", system_prompt=SUMMARIZER_SYSTEM_PROMPT))
 
-        # One episode type (recursive)
-        self.add_episode("rlm", RLMEpisode())
+        # Episode types
+        self.add_episode("rlm", RLMEpisode(context_threshold=context_threshold))
+        self.add_episode("summarize", SummarizationEpisode())
 
         # Data store
         self.add_store("tasks")
