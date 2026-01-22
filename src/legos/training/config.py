@@ -77,3 +77,14 @@ class TrainerConfig:
     # === Checkpointing ===
     checkpoint_every: int = 0  # Save every N steps (0 = disabled)
     checkpoint_dir: Optional[str] = None
+
+    # === Memory Optimization ===
+    # Chunk size for fused LM head computation (memory-efficient logprobs)
+    # None = auto (enabled for vocab >= 32K with chunk_size=2048)
+    # 0 = disabled (use full materialization)
+    # int > 0 = explicit chunk size
+    fused_lm_head_chunk_size: Optional[int] = None
+
+    # Gradient checkpointing: recompute activations during backward pass
+    # Trades ~33% more compute for significantly less peak memory
+    gradient_checkpointing: bool = False

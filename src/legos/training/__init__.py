@@ -38,6 +38,13 @@ from .trainer import Trainer
 from .loop import training_loop, synchronous_training_loop
 from .batching import split_by_token_budget, collate, estimate_tokens, form_micro_batch
 from .loss import compute_loss, get_per_token_logps, make_loss_fn
+from .fused_lm_head import (
+    FusedLMHead,
+    chunked_logprobs,
+    chunked_logprobs_quantized,
+    compute_chunked_logprobs,
+    is_quantized_embedding,
+)
 
 __all__ = [
     # Core classes
@@ -55,4 +62,10 @@ __all__ = [
     "compute_loss",
     "get_per_token_logps",
     "make_loss_fn",
+    # Fused LM Head (memory-efficient logprobs)
+    "FusedLMHead",
+    "chunked_logprobs",
+    "chunked_logprobs_quantized",
+    "compute_chunked_logprobs",
+    "is_quantized_embedding",
 ]

@@ -228,6 +228,7 @@ class GRPOCredit(CreditAssigner):
                 # Compute advantages per actor
                 actor_advantages: Dict[str, List[float]] = {}
                 for actor_id in actor_keys:
+                    # here each rollout should have the same dict with the same actor_id(s)
                     rewards = [r.rewards.get(actor_id, 0.0) for r in rollouts]
                     actor_advantages[actor_id] = _compute_grpo_advantages(
                         rewards, self.normalize, self.positive_only

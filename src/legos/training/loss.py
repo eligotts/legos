@@ -5,28 +5,65 @@ Uses PPO-style clipped importance sampling:
 - Forward pass to recompute logprobs under current policy
 - PPO-style clipped objective with importance ratio
 - KL penalty to prevent policy collapse (K1 advantage shaping - inspired by arXiv:2512.21852)
+
+Supports memory-efficient chunked logprob computation for large vocabularies via
+the fused_lm_head module.
 """
 from contextlib import contextmanager
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from .fused_lm_head import compute_chunked_logprobs
 
-def get_per_token_logps(
+
+def _get_lm_head_or_embed(model: nn.Module):
+    """
+    Get the LM head layer or embedding layer from a model.
+
+    For chunked logprob computation, we need access to either:
+    - model.lm_head (nn.Linear or nn.QuantizedLinear), OR
+    - model.model.embed_tokens (nn.Embedding or nn.QuantizedEmbedding) for tied embeddings
+
+    Args:
+        model: The language model
+
+    Returns:
+        The lm_head layer, embed_tokens layer, or weight matrix
+    """
+    # Standard case: model.lm_head (most HF/mlx-lm models)
+    if hasattr(model, "lm_head"):
+        return model.lm_head
+
+    # Tied embeddings: lm_head shares weights with embed_tokens
+    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+        return model.model.embed_tokens
+
+    raise ValueError(
+        "Could not find lm_head or embed_tokens. Model should have either "
+        "model.lm_head or model.model.embed_tokens (tied embeddings)"
+    )
+
+
+def _get_per_token_logps_full(
     model: nn.Module,
     input_ids: mx.array,
-) -> mx.array:
+) -> Tuple[mx.array, None]:
     """
-    Forward pass to compute per-token log-probabilities.
+    Forward pass to compute per-token log-probabilities using full materialization.
+
+    This is the standard approach that materializes the full [batch, seq, vocab]
+    tensor.
 
     Args:
         model: The language model (must return logits)
         input_ids: Token IDs, shape (batch, seq_len)
 
     Returns:
-        Log-probabilities for each token, shape (batch, seq_len - 1)
-        logprobs[i] is the log-prob of input_ids[i+1] given input_ids[:i+1]
+        Tuple of (logprobs, None) where:
+            - logprobs: Log-probabilities for each token, shape (batch, seq_len - 1); logprobs[i] is the log-prob of input_ids[i+1] given input_ids[:i+1]
+            - None: Entropy is not computed in full mode
     """
     # Forward pass to get logits
     logits = model(input_ids)  # (batch, seq_len, vocab_size)
@@ -43,7 +80,104 @@ def get_per_token_logps(
     token_log_probs = mx.take_along_axis(log_probs, targets_expanded, axis=-1)
     token_log_probs = mx.squeeze(token_log_probs, axis=-1)  # (batch, seq_len - 1)
 
-    return token_log_probs
+    return token_log_probs, None
+
+
+def _get_per_token_logps_chunked(
+    model: nn.Module,
+    input_ids: mx.array,
+    chunk_size: int,
+) -> Tuple[mx.array, mx.array]:
+    """
+    Forward pass to compute per-token log-probabilities using chunked processing.
+
+    This memory-efficient approach processes the vocabulary in chunks,
+    avoiding materialization of the full [batch, seq, vocab] tensor.
+    Also computes entropy as a byproduct.
+
+    Supports both quantized and non-quantized models by using the unified
+    compute_chunked_logprobs interface which auto-detects the model type.
+
+    Args:
+        model: The language model (must have model.model for backbone access)
+        input_ids: Token IDs, shape (batch, seq_len)
+        chunk_size: Number of vocabulary tokens to process at once
+
+    Returns:
+        Tuple of (logprobs, entropy) where:
+            - logprobs: Log-probabilities for each token, shape (batch, seq_len - 1); logprobs[i] is the log-prob of input_ids[i+1] given input_ids[:i+1]
+            - entropy: Per-token entropy, shape (batch, seq_len - 1)
+    """
+    batch_size, seq_len = input_ids.shape
+
+    # Get hidden states from model backbone
+    # Assumes model has a .model attribute for the transformer backbone
+    if hasattr(model, "model"):
+        outputs = model.model(input_ids)
+        # Handle different output formats
+        if hasattr(outputs, "last_hidden_state"):
+            hidden_states = outputs.last_hidden_state
+        elif isinstance(outputs, tuple):
+            hidden_states = outputs[0]
+        else:
+            hidden_states = outputs
+    else:
+        raise ValueError("Model must have a .model attribute for backbone access")
+
+    # Get lm_head or embed_tokens layer (handles both quantized and non-quantized)
+    lm_head_or_embed = _get_lm_head_or_embed(model)
+
+    # Shift: hidden[:-1] predicts targets[1:]
+    hidden_states = hidden_states[:, :-1, :]  # (batch, seq_len - 1, hidden_dim)
+    targets = input_ids[:, 1:]  # (batch, seq_len - 1)
+
+    # Flatten for chunked processing
+    new_seq_len = seq_len - 1
+    hidden_flat = hidden_states.reshape(batch_size * new_seq_len, -1)  # [N, hidden_dim]
+    labels_flat = targets.reshape(batch_size * new_seq_len)  # [N]
+
+    # Compute logprobs and entropy using chunked approach
+    # This auto-detects quantized vs non-quantized and uses the appropriate path
+    logprobs_flat, entropy_flat = compute_chunked_logprobs(
+        hidden_flat, lm_head_or_embed, labels_flat, chunk_size
+    )
+
+    # Reshape back to [batch, seq_len - 1]
+    logprobs = logprobs_flat.reshape(batch_size, new_seq_len)
+    entropy = entropy_flat.reshape(batch_size, new_seq_len)
+
+    return logprobs, entropy
+
+
+def get_per_token_logps(
+    model: nn.Module,
+    input_ids: mx.array,
+    chunk_size: Optional[int] = None,
+) -> Tuple[mx.array, Optional[mx.array]]:
+    """
+    Forward pass to compute per-token log-probabilities (and optionally entropy).
+
+    This is the main entry point for computing log-probabilities during training.
+    When chunk_size is provided, uses memory-efficient chunked processing that
+    also computes entropy. When chunk_size is None, uses standard full
+    materialization.
+
+    Args:
+        model: The language model (must return logits)
+        input_ids: Token IDs, shape (batch, seq_len)
+        chunk_size: If provided, use chunked processing with this chunk size.
+                   If None, use full materialization.
+
+    Returns:
+        Tuple of (logprobs, entropy) where:
+            - logprobs: Log-probabilities for each token, shape (batch, seq_len - 1)
+            - entropy: Per-token entropy if chunk_size provided, else None
+              logprobs[i] is the log-prob of input_ids[i+1] given input_ids[:i+1]
+    """
+    if chunk_size is not None:
+        return _get_per_token_logps_chunked(model, input_ids, chunk_size)
+    else:
+        return _get_per_token_logps_full(model, input_ids)
 
 
 @contextmanager
@@ -81,7 +215,11 @@ def disable_lora(model: nn.Module):
             model.train()
 
 
-def get_ref_logprobs(model: nn.Module, input_ids: mx.array) -> mx.array:
+def get_ref_logprobs(
+    model: nn.Module,
+    input_ids: mx.array,
+    chunk_size: Optional[int] = None,
+) -> mx.array:
     """
     Get log-probabilities from the base model with LoRA disabled.
 
@@ -91,12 +229,14 @@ def get_ref_logprobs(model: nn.Module, input_ids: mx.array) -> mx.array:
     Args:
         model: The language model with LoRA attached
         input_ids: Token IDs, shape (batch, seq_len)
+        chunk_size: If provided, use chunked processing
 
     Returns:
         Reference log-probabilities, shape (batch, seq_len - 1)
     """
     with disable_lora(model):
-        ref_logprobs = mx.stop_gradient(get_per_token_logps(model, input_ids))
+        ref_logprobs, _ = get_per_token_logps(model, input_ids, chunk_size)
+        ref_logprobs = mx.stop_gradient(ref_logprobs)
         mx.eval(ref_logprobs)  # Materialize to free computation graph
     return ref_logprobs
 
@@ -116,6 +256,7 @@ def compute_loss(
     gspo_clip_epsilon: float = 3e-4,
     kl_clip_max: float = 0.5,
     clip_skip_threshold: float = 0.5,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[mx.array, Dict[str, mx.array]]:
     """
     Compute the RL loss for policy gradient training.
@@ -140,11 +281,13 @@ def compute_loss(
         gspo_clip_epsilon: Clip epsilon for GSPO (sequence mode uses 1 ± epsilon)
         kl_clip_max: Maximum K1 value before clipping (prevents extreme shaping)
         clip_skip_threshold: Skip batch if clip fraction exceeds this threshold
+        chunk_size: If provided, use chunked logprob computation for memory efficiency.
+                   Also computes and logs entropy when enabled.
 
     Returns:
         Tuple of (loss, metrics_dict)
         - loss: Scalar loss value (0 if batch skipped)
-        - metrics_dict: Dictionary with clip_fraction, kl, skip_batch, etc.
+        - metrics_dict: Dictionary with clip_fraction, kl, skip_batch, entropy (if chunked), etc.
     """
     # Slice to (batch, seq_len - 1) to align with prediction semantics
     # collate() returns (batch, seq_len) but we need to match trainer_logprobs
@@ -155,14 +298,21 @@ def compute_loss(
 
     metrics = {}
 
-    # Forward pass to get current policy log-probs
-    trainer_logprobs = get_per_token_logps(model, input_ids)
+    # Forward pass to get current policy log-probs (and entropy if chunked)
+    trainer_logprobs, entropy = get_per_token_logps(model, input_ids, chunk_size)
+
+    # Log entropy if computed (chunked mode)
+    if entropy is not None:
+        # Entropy is for monitoring only - use stop_gradient to ensure no backprop
+        entropy = mx.stop_gradient(entropy)
+        mean_entropy = (entropy * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1.0)
+        metrics["entropy"] = mean_entropy
 
     # K1 KL shaping: compute KL divergence from reference policy (base model)
     # and subtract from advantages to discourage policy drift
     if use_kl_penalty:
         # Get reference policy logprobs (base model, LoRA disabled)
-        ref_logprobs = get_ref_logprobs(model, input_ids)
+        ref_logprobs = get_ref_logprobs(model, input_ids, chunk_size)
 
         # Per-token K1: log π_new(a) - log π_ref(a)
         k1_t = trainer_logprobs - ref_logprobs  # (batch, seq_len-1)
@@ -328,6 +478,7 @@ def make_loss_fn(
     gspo_clip_epsilon: float = 3e-4,
     kl_clip_max: float = 0.5,
     clip_skip_threshold: float = 0.5,
+    chunk_size: Optional[int] = None,
 ):
     """
     Create a loss function suitable for use with nn.value_and_grad.
@@ -349,6 +500,8 @@ def make_loss_fn(
         gspo_clip_epsilon: Clip epsilon for GSPO (sequence mode uses 1 ± epsilon)
         kl_clip_max: Maximum K1 value before clipping (prevents extreme shaping)
         clip_skip_threshold: Skip batch if clip fraction exceeds this threshold
+        chunk_size: If provided, use chunked logprob computation for memory efficiency.
+                   Also computes and logs entropy when enabled.
 
     Returns:
         A loss function compatible with nn.value_and_grad that returns (loss, metrics)
@@ -376,6 +529,7 @@ def make_loss_fn(
             gspo_clip_epsilon=gspo_clip_epsilon,
             kl_clip_max=kl_clip_max,
             clip_skip_threshold=clip_skip_threshold,
+            chunk_size=chunk_size,
         )
         # Return (loss, metrics) - value_and_grad diffs w.r.t. loss, passes through metrics
         return loss, metrics

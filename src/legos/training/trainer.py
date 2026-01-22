@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -45,6 +45,26 @@ def compute_per_actor_reward_stats(records: List[TrainingRecord]) -> Dict[str, f
         stats[f"reward_{actor_id}_count"] = float(len(rewards))
 
     return stats
+
+
+def _apply_gradient_checkpointing(model: nn.Module) -> None:
+    """Wrap transformer layers with mx.checkpoint for memory efficiency.
+
+    MLX's mx.checkpoint(fn) wraps a function to discard intermediate activations
+    during forward pass. During backward pass, activations are recomputed on-the-fly.
+    Trade-off: ~33% more compute for significantly less peak memory.
+    """
+    # Handle mlx-lm style models (model.model.layers)
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers = model.model.layers
+    elif hasattr(model, "layers"):
+        layers = model.layers
+    else:
+        return  # Unknown architecture, skip
+
+    for layer in layers:
+        original_call = layer.__call__
+        layer.__call__ = mx.checkpoint(original_call)
 
 
 class Trainer:
@@ -88,6 +108,13 @@ class Trainer:
 
         self.train_step_idx = 0
 
+        # Apply gradient checkpointing if enabled
+        if config.gradient_checkpointing:
+            _apply_gradient_checkpointing(model)
+
+        # Resolve chunk_size for fused LM head
+        self.chunk_size = self._resolve_chunk_size()
+
         # Create loss function for value_and_grad
         self._loss_fn = make_loss_fn(
             clip_low=config.ppo_clip_min,
@@ -99,6 +126,7 @@ class Trainer:
             gspo_clip_epsilon=config.gspo_clip_epsilon,
             kl_clip_max=config.kl_max,
             clip_skip_threshold=config.clip_skip_threshold,
+            chunk_size=self.chunk_size,
         )
 
         # GSPO requires sample-level weighting (not token-level) for gradient accumulation
@@ -109,6 +137,49 @@ class Trainer:
 
         # Streaming gradient accumulation state
         self._reset_pending()
+
+    def _resolve_chunk_size(self) -> Optional[int]:
+        """
+        Resolve the effective chunk size based on config and model vocab size.
+
+        Returns:
+            The chunk size to use, or None if chunking should be disabled.
+        """
+        chunk_size = self.config.fused_lm_head_chunk_size
+
+        if chunk_size is None:
+            # Auto-detect: enable for large vocabularies
+            vocab_size = self._get_vocab_size()
+            if vocab_size >= 32000:
+                return 2048
+            else:
+                return None
+        elif chunk_size == 0:
+            # Explicitly disabled
+            return None
+        else:
+            # Use explicit chunk size
+            return chunk_size
+
+    def _get_vocab_size(self) -> int:
+        """
+        Get the vocabulary size from the model.
+
+        Assumes HuggingFace/mlx-lm style model structure.
+        """
+        # Primary: model.config.vocab_size (all HF/mlx-lm models have this)
+        if hasattr(self.model, "config") and hasattr(self.model.config, "vocab_size"):
+            return self.model.config.vocab_size
+
+        # Fallback: infer from lm_head or embed_tokens weight shape
+        if hasattr(self.model, "lm_head"):
+            return self.model.lm_head.weight.shape[0]
+
+        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+            return self.model.model.embed_tokens.weight.shape[0]
+
+        # Conservative default: won't auto-enable chunking
+        return 32000
 
     def _reset_pending(self) -> None:
         """Reset streaming accumulation state after optimizer step."""
@@ -221,6 +292,12 @@ class Trainer:
                 self._weighted_grad_sum,
                 grads,
             )
+
+        # CRITICAL: Evaluate accumulated gradients to break computation graph chain.
+        # Without this, each micro-batch's gradient sum holds references to ALL
+        # previous forward passes' activations, causing memory to grow unboundedly.
+        if self.config.eval_per_micro_batch:
+            mx.eval(self._weighted_grad_sum)
 
         # Track state for this micro-batch
         self._pending_samples += n_samples
